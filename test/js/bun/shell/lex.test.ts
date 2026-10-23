@@ -1159,9 +1159,14 @@ describe("lex shell", () => {
     });
 
     test("forms nest to the depth of $(...), and deeper forms are text", () => {
+      const forms = (source: string) => tokens(source).filter((token: object) => "ParamBegin" in token);
       const nested = (depth: number) => "${A:-".repeat(depth) + "x" + "}".repeat(depth);
-      expect(tokens(nested(100)).filter((token: object) => "ParamBegin" in token)).toHaveLength(100);
-      expect(tokens(nested(200)).filter((token: object) => "ParamBegin" in token)).toHaveLength(0);
+      expect(forms(nested(128))).toHaveLength(128);
+      expect(forms(nested(129))).toHaveLength(0);
+      // A form counts as one level of $(...).
+      const inSubst = (depth: number) => "$(echo ".repeat(depth) + "${A:-x}" + ")".repeat(depth);
+      expect(forms(inSubst(127))).toHaveLength(1);
+      expect(forms(inSubst(128))).toHaveLength(0);
     });
 
     // An interpolated value is data. It never supplies the name, the operator

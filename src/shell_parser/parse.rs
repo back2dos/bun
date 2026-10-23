@@ -3709,11 +3709,12 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         } else {
             return Ok(false);
         };
+        // Set before the depth error below, so that the script is lexed again with this form as text.
+        self.saw_param_head = true;
         if op.is_some() && self.subshell_depth >= MAX_SUBSHELL_DEPTH {
             self.add_error(b"Subshell nesting depth exceeded");
             return Err(LexerError::SubshellDepthExceeded);
         }
-        self.saw_param_head = true;
 
         let quoted = self.chars.state == CharState::Double;
         if let Some(op) = op {

@@ -1770,6 +1770,10 @@ booga"
         const nested = (depth: number) => ({ raw: "${A:-".repeat(depth) + "x" + "}".repeat(depth) });
         expect(await $`echo ${nested(128)}`.text()).toBe("x\n");
         expect(await $`echo ${nested(129)}`.text()).toBe(nested(129).raw + "\n");
+        // A form counts as one level of $(...).
+        const inSubst = (depth: number) => ({ raw: "$(echo ".repeat(depth) + "${A:-x}" + ")".repeat(depth) });
+        expect(await $`echo ${inSubst(127)}`.text()).toBe("x\n");
+        expect(await $`echo ${inSubst(128)}`.text()).toBe("${A:-x}\n");
       });
     });
   });
