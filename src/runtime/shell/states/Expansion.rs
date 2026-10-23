@@ -9,10 +9,11 @@ use crate::shell::interpreter::{
     EventLoopHandle, Interpreter, Node, NodeId, ShellExecEnv, ShellExecEnvKind, StateKind, log,
 };
 use crate::shell::io::{IO, OutKind};
+use crate::shell::states::assigns::{AssignCtx, AssignsState};
 use crate::shell::states::base::Base;
 use crate::shell::states::script::Script;
 use crate::shell::yield_::Yield;
-use crate::shell::{ExitCode, ShellErr};
+use crate::shell::{EnvStr, ExitCode, ShellErr};
 
 pub(crate) struct Expansion {
     pub(crate) base: Base,
@@ -36,6 +37,7 @@ pub(crate) struct Expansion {
     /// (JS interpolation, quoted text, `$var`, command substitution) are data
     /// and must not change the expansion structure or broaden the glob.
     pub(crate) meta_offsets: Vec<u32>,
+    /// The `Script` of a `$(...)`, or in `ExpansionState::ParamWord` the `Expansion` of a word.
     pub(crate) child_script: Option<NodeId>,
     /// Whether the in-flight command substitution was `"$(...)"` (no IFS
     /// splitting on its result). Only meaningful while `state == CmdSubst`.
@@ -60,6 +62,8 @@ pub enum ExpansionState {
     Idle,
     Walking,
     CmdSubst,
+    /// The word of the `${NAME<op>word}` at `word_idx` holds a `$(...)` and expands in a child `Expansion`.
+    ParamWord,
     Glob,
     BraceExpand,
     Done,
@@ -67,6 +71,29 @@ pub enum ExpansionState {
     /// `child_done(_, 1)` to print the message.
     Err(Box<ShellErr>),
 }
+
+/// What [`Expansion::expand_simple_no_io`] leaves to its caller.
+enum Step {
+    /// Nothing: the atom is expanded.
+    Next,
+    /// A `$(...)` to run.
+    CmdSubst,
+    /// A `${NAME<op>word}`.
+    Param,
+    /// Unquoted whitespace in the word of a `${NAME<op>word}`.
+    ParamSpace,
+}
+
+/// What a `${NAME<op>word}` reads besides the shell environment.
+struct ParamCtx<'a> {
+    event_loop: EventLoopHandle,
+    command_ctx: *mut bun_options_types::context::ContextData,
+    vm_args_utf8: &'a mut Vec<bun_core::Utf8Bytes<'static>>,
+    /// In the value of a prefix assignment (`A=1 B=${A:-2} cmd`): the assignments before it.
+    earlier_assigns: &'a [ast::Assign],
+}
+
+const _: () = assert!(size_of::<Expansion>() == 168);
 
 #[derive(Default)]
 pub(crate) struct ExpansionOut {
@@ -122,7 +149,7 @@ impl Expansion {
     /// child `Script` whenever a `$(...)` is encountered. Re-entered after
     /// `child_done` advances `word_idx`.
     pub(crate) fn next(interp: &Interpreter, this: NodeId) -> Yield {
-        loop {
+        'next: loop {
             // Split-borrow: `me` from `nodes`, `vm_args_utf8` from its own
             // field, so `expand_simple_no_io` can expand `$N` without aliasing.
             // R-2: both are `JsCell`-backed; `as_ptr()`/`node_mut()` project
@@ -138,11 +165,16 @@ impl Expansion {
                     me.state = ExpansionState::Walking;
                     continue;
                 }
-                ExpansionState::CmdSubst | ExpansionState::Glob => {
+                ExpansionState::CmdSubst | ExpansionState::ParamWord | ExpansionState::Glob => {
                     // Re-entered while a child is in flight.
                     return Yield::suspended();
                 }
                 ExpansionState::BraceExpand => {
+                    // A `ParamSpace` ended the last argument: nothing is left to expand.
+                    if me.current_out.is_empty() && !me.out.buf.is_empty() {
+                        me.state = ExpansionState::Done;
+                        continue;
+                    }
                     Self::do_brace_expand(me);
                     // brace + glob composes: after pushing the literal brace
                     // variants, glob the original pattern. The normal glob path likewise calls
@@ -176,7 +208,7 @@ impl Expansion {
                     ast::Atom::Compound(c) => &c.atoms[me.word_idx as usize],
                 };
                 let shell = me.base.shell();
-                let is_cmd_subst = Self::expand_simple_no_io(
+                match Self::expand_simple_no_io(
                     shell,
                     simple,
                     &mut me.current_out,
@@ -186,10 +218,26 @@ impl Expansion {
                     event_loop,
                     command_ctx,
                     vm_args_utf8,
-                );
-                if !is_cmd_subst {
-                    me.word_idx += 1;
-                    continue;
+                ) {
+                    Step::Next => {
+                        me.word_idx += 1;
+                        continue;
+                    }
+                    Step::CmdSubst => {}
+                    Step::Param => {
+                        if let Some(word_child) = Self::expand_param(interp, this) {
+                            return word_child;
+                        }
+                        continue 'next;
+                    }
+                    Step::ParamSpace => {
+                        let ast::SimpleAtom::ParamSpace(space) = simple else {
+                            unreachable!()
+                        };
+                        Self::expand_param_space(me, space);
+                        me.word_idx += 1;
+                        continue;
+                    }
                 }
                 // ── Command substitution: spawn a Script with stdout piped
                 //    into a fresh owned buffer.
@@ -353,7 +401,7 @@ impl Expansion {
 
         let node = me.node;
         let atom = node.get();
-        if atom.has_glob_expansion() {
+        if atom.has_glob_expansion() && Self::has_glob_syntax(me) {
             // brace + glob composes. Keep
             // `current_out` (the original pattern, e.g. `src/*.{ts,tsx}`) so
             // the glob walker brace-expands and globs it; its matches are
@@ -433,6 +481,28 @@ impl Expansion {
         pattern
     }
 
+    /// Whether the word has a `*` from the script. An atom has its glob hint from a `*` of its own, or from the
+    /// word of a `${NAME<op>word}`, which adds a `*` only when that word is the result.
+    fn has_glob_syntax(me: &Expansion) -> bool {
+        let is_glob = |atom: &ast::SimpleAtom| {
+            matches!(
+                atom,
+                ast::SimpleAtom::Asterisk | ast::SimpleAtom::DoubleAsterisk
+            )
+        };
+        let node = me.node;
+        match node.get() {
+            ast::Atom::Simple(simple) => is_glob(simple),
+            ast::Atom::Compound(compound) => {
+                compound.atoms.iter().any(is_glob)
+                    || me
+                        .meta_offsets
+                        .iter()
+                        .any(|&offset| me.current_out.get(offset as usize) == Some(&b'*'))
+            }
+        }
+    }
+
     /// Kick off an off-thread
     /// glob walk for the assembled pattern in `current_out`.
     fn transition_to_glob_state(interp: &Interpreter, this: NodeId) -> Yield {
@@ -441,6 +511,16 @@ impl Expansion {
         let cwd: Vec<u8>;
         {
             let me = interp.as_expansion_mut(this);
+            // The word of a `${NAME<op>word}` is not a pattern in its child `Expansion`: a `*` in it is text there.
+            let is_param_word = matches!(interp.node(me.base.parent), Node::Expansion(_));
+            if is_param_word || !Self::has_glob_syntax(me) {
+                // A `ParamSpace` can leave no argument to end here.
+                if !me.current_out.is_empty() || me.out.buf.is_empty() {
+                    Self::push_current_out(me);
+                }
+                me.state = ExpansionState::Done;
+                return Yield::Next(this);
+            }
             me.state = ExpansionState::Glob;
             pattern = Self::neutralize_glob_metachars(&me.current_out, &me.meta_offsets);
             cwd = me.base.shell().cwd().to_vec();
@@ -466,8 +546,8 @@ impl Expansion {
     }
 
     /// Appends the no-IO expansion of
-    /// one [`ast::SimpleAtom`] to `out`. Returns `true` for `CmdSubst` so the
-    /// caller spawns a `Script` for it.
+    /// one [`ast::SimpleAtom`] to `out`. Returns what is left for the caller:
+    /// it spawns a `Script` for a `CmdSubst`.
     fn expand_simple_no_io(
         shell: &ShellExecEnv,
         atom: &ast::SimpleAtom,
@@ -478,8 +558,7 @@ impl Expansion {
         event_loop: EventLoopHandle,
         command_ctx: *mut bun_options_types::context::ContextData,
         vm_args_utf8: &mut Vec<bun_core::Utf8Bytes<'static>>,
-    ) -> bool {
-        use crate::shell::env_str::EnvStr;
+    ) -> Step {
         match atom {
             ast::SimpleAtom::Text(txt) => out.extend_from_slice(txt),
             ast::SimpleAtom::QuotedEmpty => {
@@ -504,6 +583,8 @@ impl Expansion {
                 // SAFETY: `command_ctx` is the live VM ctx; `vm_args_utf8` borrows it.
                 Interpreter::append_var_argv(out, *int, event_loop, command_ctx, vm_args_utf8);
             }
+            ast::SimpleAtom::Param(_) => return Step::Param,
+            ast::SimpleAtom::ParamSpace(_) => return Step::ParamSpace,
             ast::SimpleAtom::Asterisk => {
                 meta_offsets.push(out.len() as u32);
                 out.push(b'*');
@@ -536,9 +617,321 @@ impl Expansion {
                     out.push(b'~');
                 }
             }
-            ast::SimpleAtom::CmdSubst(_) => return true,
+            ast::SimpleAtom::CmdSubst(_) => return Step::CmdSubst,
         }
+        Step::Next
+    }
+
+    /// Expands the `${NAME<op>word}` at `word_idx`. `Some`: its word runs in a child `Expansion` and this node waits.
+    #[cold]
+    fn expand_param(interp: &Interpreter, this: NodeId) -> Option<Yield> {
+        let mut ctx = ParamCtx {
+            event_loop: interp.event_loop,
+            command_ctx: interp.command_ctx,
+            // SAFETY: single-JS-thread; `vm_args_utf8` and `nodes` are
+            // disjoint `JsCell` fields (no aliasing between the two borrows).
+            vm_args_utf8: unsafe { &mut *interp.vm_args_utf8.as_ptr() },
+            earlier_assigns: Self::earlier_prefix_assigns(interp, this),
+        };
+        let me = interp.as_expansion_mut(this);
+        let param = Self::param_at_word_idx(me);
+        if !Self::expand_param_value(me, param, &mut ctx) {
+            me.word_idx += 1;
+            return None;
+        }
+        if !param.word_has_cmd_subst {
+            let splits = !me.assign_ctx;
+            if Self::expand_param_word_no_io(me, param, splits, &mut ctx) {
+                me.word_idx += 1;
+            }
+            return None;
+        }
+
+        // The value of a `=` and the message of a `?` are one string, like the value of an assignment.
+        let one_string = me.assign_ctx
+            || matches!(
+                param.op.action,
+                ast::ParamAction::Assign | ast::ParamAction::Error
+            );
+        me.state = ExpansionState::ParamWord;
+        let shell = me.base.shell;
+        let child = Self::init(interp, shell, &raw const param.word, this, one_string);
+        interp.as_expansion_mut(this).child_script = Some(child);
+        Some(Self::start(interp, child))
+    }
+
+    fn param_at_word_idx(me: &Expansion) -> &'static ast::ParamExp {
+        let node = me.node;
+        let simple = match node.get() {
+            ast::Atom::Simple(s) => s,
+            ast::Atom::Compound(c) => &c.atoms[me.word_idx as usize],
+        };
+        let ast::SimpleAtom::Param(param) = simple else {
+            unreachable!("the atom at word_idx is a Param")
+        };
+        param
+    }
+
+    /// In the value of a prefix assignment (`A=1 B=${A:-2} cmd`): the assignments before that value.
+    fn earlier_prefix_assigns(interp: &Interpreter, this: NodeId) -> &[ast::Assign] {
+        let mut parent = interp.as_expansion(this).base.parent;
+        // The word of a `${NAME<op>word}` in the value: its parent is the `Expansion` of the value.
+        while let Node::Expansion(word_parent) = interp.node(parent) {
+            parent = word_parent.base.parent;
+        }
+        match interp.node(parent) {
+            Node::Assigns(assigns) if assigns.ctx == AssignCtx::Cmd => match assigns.state {
+                AssignsState::Expanding { idx } => &assigns.node.slice()[..idx as usize],
+                _ => &[],
+            },
+            _ => &[],
+        }
+    }
+
+    /// Appends the value of the parameter when that is the result. `true`: the result is the word, and nothing was
+    /// appended.
+    fn expand_param_value(
+        me: &mut Expansion,
+        param: &ast::ParamExp,
+        ctx: &mut ParamCtx<'_>,
+    ) -> bool {
+        let len = me.current_out.len();
+        let set = match param.target {
+            ast::ParamTarget::Name(name) => {
+                let shell = me.base.shell();
+                // `Cmd` keeps prefix assignments in `cmd_local_env`, which also holds those of earlier commands.
+                let in_prefix = ctx
+                    .earlier_assigns
+                    .iter()
+                    .any(|assign| assign.label == name);
+                let value = in_prefix
+                    .then(|| shell.cmd_local_env.get(EnvStr::init_slice(name)))
+                    .flatten()
+                    .or_else(|| shell.shell_env.get(EnvStr::init_slice(name)))
+                    .or_else(|| shell.export_env.get(EnvStr::init_slice(name)));
+                match value {
+                    Some(value) => {
+                        me.current_out.extend_from_slice(value.slice());
+                        value.deref();
+                        true
+                    }
+                    None => false,
+                }
+            }
+            // SAFETY: `command_ctx` is the live VM ctx; `vm_args_utf8` borrows it.
+            ast::ParamTarget::Positional(int) => Interpreter::append_var_argv(
+                &mut me.current_out,
+                int,
+                ctx.event_loop,
+                ctx.command_ctx,
+                ctx.vm_args_utf8,
+            ),
+        };
+        let absent = param.op.is_absent(set, me.current_out.len() == len);
+        let is_alternate = param.op.action == ast::ParamAction::Alternate;
+        if absent == is_alternate {
+            // `+` gives nothing for an absent parameter. The other operators give the value of a present one.
+            if is_alternate {
+                me.current_out.truncate(len);
+            }
+            return false;
+        }
+        me.current_out.truncate(len);
+        true
+    }
+
+    /// Expands the word of a `${NAME<op>word}` that holds no `$(...)` and applies the operator. `splits`: unquoted
+    /// whitespace in the word ends an argument. `false`: the expansion failed and `state` is the error.
+    fn expand_param_word_no_io(
+        me: &mut Expansion,
+        param: &ast::ParamExp,
+        splits: bool,
+        ctx: &mut ParamCtx<'_>,
+    ) -> bool {
+        debug_assert!(!param.word_has_cmd_subst);
+        let ast::Atom::Compound(word) = &param.word else {
+            unreachable!("the word of a Param is a compound atom")
+        };
+        match param.op.action {
+            ast::ParamAction::Default | ast::ParamAction::Alternate => {
+                Self::expand_word_atoms_no_io(me, word.atoms, splits, ctx)
+            }
+            ast::ParamAction::Assign | ast::ParamAction::Error => {
+                let len = me.current_out.len();
+                let meta_len = me.meta_offsets.len();
+                let has_quoted_empty = me.has_quoted_empty;
+                if !Self::expand_word_atoms_no_io(me, word.atoms, false, ctx) {
+                    return false;
+                }
+                // The word is a value here: a `*` or a `""` in it is not syntax of the argument.
+                let value = me.current_out.split_off(len);
+                me.meta_offsets.truncate(meta_len);
+                me.has_quoted_empty = has_quoted_empty;
+                Self::apply_param_word(me, param, value)
+            }
+        }
+    }
+
+    fn expand_word_atoms_no_io(
+        me: &mut Expansion,
+        atoms: &[ast::SimpleAtom],
+        splits: bool,
+        ctx: &mut ParamCtx<'_>,
+    ) -> bool {
+        for atom in atoms {
+            match atom {
+                ast::SimpleAtom::Param(inner) => {
+                    if Self::expand_param_value(me, inner, ctx)
+                        && !Self::expand_param_word_no_io(me, inner, splits, ctx)
+                    {
+                        return false;
+                    }
+                }
+                ast::SimpleAtom::ParamSpace(_) if splits => {
+                    if !me.current_out.is_empty() {
+                        Self::push_current_out(me);
+                    }
+                }
+                ast::SimpleAtom::ParamSpace(space) => me.current_out.extend_from_slice(space),
+                _ => {
+                    let shell = me.base.shell();
+                    let _ = Self::expand_simple_no_io(
+                        shell,
+                        atom,
+                        &mut me.current_out,
+                        &mut me.meta_offsets,
+                        &mut me.has_quoted_empty,
+                        true,
+                        ctx.event_loop,
+                        ctx.command_ctx,
+                        ctx.vm_args_utf8,
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    /// Unquoted whitespace in the word of a `${NAME<op>word}`: it ends the argument where arguments are split.
+    fn expand_param_space(me: &mut Expansion, space: &[u8]) {
+        if me.assign_ctx {
+            me.current_out.extend_from_slice(space);
+        } else if !me.current_out.is_empty() {
+            Self::push_current_out(me);
+        }
+    }
+
+    /// Ends a `=` or a `?` form whose word expanded to `word`. `false`: `state` is an error.
+    fn apply_param_word(me: &mut Expansion, param: &ast::ParamExp, word: Vec<u8>) -> bool {
+        use std::io::Write as _;
+        let mut message: Vec<u8> = Vec::new();
+        match (param.op.action, param.target) {
+            (ast::ParamAction::Assign, ast::ParamTarget::Name(name)) => {
+                me.current_out.extend_from_slice(&word);
+                let value = EnvStr::init_ref_counted(word.into_boxed_slice());
+                me.base
+                    .shell_mut()
+                    .assign_var(EnvStr::init_slice(name), value, AssignCtx::Shell);
+                value.deref();
+                return true;
+            }
+            (ast::ParamAction::Assign, ast::ParamTarget::Positional(int)) => {
+                // A write to a `Vec` cannot fail.
+                let _ = write!(message, "${int}: cannot assign in this way");
+            }
+            (_, target) => {
+                match target {
+                    ast::ParamTarget::Name(name) => message.extend_from_slice(name),
+                    ast::ParamTarget::Positional(int) => {
+                        let _ = write!(message, "{int}");
+                    }
+                }
+                message.extend_from_slice(b": ");
+                if !word.is_empty() {
+                    message.extend_from_slice(&word);
+                } else if param.op.colon {
+                    message.extend_from_slice(b"parameter null or not set");
+                } else {
+                    message.extend_from_slice(b"parameter not set");
+                }
+            }
+        }
+        me.state = ExpansionState::Err(Box::new(ShellErr::Custom(message.into_boxed_slice())));
         false
+    }
+
+    /// The child `Expansion` of the word of the `${NAME<op>word}` at `word_idx` is done.
+    #[cold]
+    fn param_word_done(
+        interp: &Interpreter,
+        this: NodeId,
+        child: NodeId,
+        exit_code: ExitCode,
+    ) -> Yield {
+        if exit_code != 0 {
+            let err = Self::take_err(interp, child);
+            interp.deinit_node(child);
+            let me = interp.as_expansion_mut(this);
+            me.child_script = None;
+            let Some(err) = err else {
+                // The script failed in a `$(...)` of the word.
+                me.state = ExpansionState::Done;
+                let parent = me.base.parent;
+                return interp.child_done(parent, this, 1);
+            };
+            me.state = ExpansionState::Err(Box::new(err));
+            return Yield::Next(this);
+        }
+
+        let out = Self::take_out(interp, child);
+        interp.deinit_node(child);
+        let me = interp.as_expansion_mut(this);
+        me.child_script = None;
+        me.state = ExpansionState::Walking;
+        let param = Self::param_at_word_idx(me);
+        let done = match param.op.action {
+            ast::ParamAction::Default | ast::ParamAction::Alternate => {
+                Self::append_param_word_fields(me, param, &out);
+                true
+            }
+            ast::ParamAction::Assign | ast::ParamAction::Error => {
+                Self::apply_param_word(me, param, out.buf)
+            }
+        };
+        if done {
+            me.word_idx += 1;
+        }
+        Yield::Next(this)
+    }
+
+    /// Adds the arguments that the word of a `${NAME<op>word}` expanded to in its child `Expansion`.
+    fn append_param_word_fields(me: &mut Expansion, param: &ast::ParamExp, out: &ExpansionOut) {
+        let ast::Atom::Compound(word) = &param.word else {
+            unreachable!("the word of a Param is a compound atom")
+        };
+        // The child drops whitespace at the start of the word and ends its last argument at whitespace at the end.
+        let ends_argument = |atom: Option<&ast::SimpleAtom>| {
+            !me.assign_ctx && matches!(atom, Some(ast::SimpleAtom::ParamSpace(_)))
+        };
+        let (ends_before, ends_after) = (
+            ends_argument(word.atoms.first()),
+            ends_argument(word.atoms.last()),
+        );
+        if ends_before && !me.current_out.is_empty() {
+            Self::push_current_out(me);
+        }
+        let mut start = 0usize;
+        for &end in &out.bounds {
+            me.current_out
+                .extend_from_slice(&out.buf[start..end as usize]);
+            Self::push_current_out(me);
+            start = end as usize;
+        }
+        me.current_out.extend_from_slice(&out.buf[start..]);
+        me.has_quoted_empty |= out.has_quoted_empty;
+        if ends_after && !me.current_out.is_empty() {
+            Self::push_current_out(me);
+        }
     }
 
     /// Flush `current_out` into `out`
@@ -607,6 +1000,9 @@ impl Expansion {
         child: NodeId,
         exit_code: ExitCode,
     ) -> Yield {
+        if matches!(interp.as_expansion(this).state, ExpansionState::ParamWord) {
+            return Self::param_word_done(interp, this, child, exit_code);
+        }
         // Child is a Script (command substitution). Its captured stdout lives
         // in the duped `ShellExecEnv` it owns; read it before deinit.
         debug_assert!(matches!(interp.node(child).kind(), StateKind::Script));

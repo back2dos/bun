@@ -119,6 +119,8 @@ pub(crate) enum Node {
     Subshell(Subshell),
 }
 
+const _: () = assert!(size_of::<Node>() == 176);
+
 impl Node {
     pub(crate) fn kind(&self) -> StateKind {
         match self {
@@ -419,22 +421,30 @@ impl Interpreter {
         out_parser: &mut Option<bun_shell_parser::Parser<'a>>,
         out_lex_result: &mut Option<bun_shell_parser::LexResult<'a>>,
     ) -> crate::Result<bun_shell_parser::ast::Script<'a>> {
-        use crate::shell::shell_body::{LexerAscii, LexerUnicode, ParseError, Parser};
-        let lex_result = if bun_core::is_all_ascii(src) {
-            let mut lexer = LexerAscii::new(arena, src, jsstrings_to_escape, jsobjs_len);
-            lexer.lex().map_err(crate::Error::from)?;
-            lexer.get_result()
-        } else {
-            let mut lexer = LexerUnicode::new(arena, src, jsstrings_to_escape, jsobjs_len);
-            lexer.lex().map_err(crate::Error::from)?;
-            lexer.get_result()
-        };
-        if !lex_result.errors.is_empty() {
-            *out_lex_result = Some(lex_result);
-            return Err(ParseError::Lex.into());
+        use crate::shell::shell_body::{ParseError, Parser};
+        let mut param_heads = true;
+        loop {
+            let lexed =
+                bun_shell_parser::lex(arena, src, jsstrings_to_escape, jsobjs_len, param_heads);
+            // See `bun_shell_parser::lex`. The second pass reads no `${...}` form, so it is the last one.
+            let retry_as_text = lexed.saw_param_head;
+            if retry_as_text && lexed.failed() {
+                param_heads = false;
+                continue;
+            }
+            let lex_result = lexed.result.map_err(crate::Error::from)?;
+            if !lex_result.errors.is_empty() {
+                *out_lex_result = Some(lex_result);
+                return Err(ParseError::Lex.into());
+            }
+            let parsed = out_parser.insert(Parser::new(arena, lex_result)).parse();
+            if parsed.is_err() && retry_as_text {
+                *out_parser = None;
+                param_heads = false;
+                continue;
+            }
+            return Ok(parsed?);
         }
-        *out_parser = Some(Parser::new(arena, lex_result));
-        Ok(out_parser.as_mut().unwrap().parse()?)
     }
 
     /// Builds the root `ShellExecEnv` (export env from the event loop's
@@ -970,7 +980,9 @@ impl Interpreter {
             ast::Expr::Cmd(c) => Cmd::init(self, shell, *c, parent, io),
             ast::Expr::Binary(b) => Binary::init(self, shell, *b, parent, io),
             ast::Expr::Pipeline(p) => Pipeline::init(self, shell, *p, parent, io),
-            ast::Expr::Assign(a) => Assigns::init(self, shell, *a, parent, AssignCtx::Shell),
+            ast::Expr::Assign(a) => {
+                Assigns::init(self, shell, *a, parent, AssignCtx::Shell, Some(io))
+            }
             ast::Expr::If(i) => If::init(self, shell, *i, parent, io),
             ast::Expr::CondExpr(c) => CondExpr::init(self, shell, *c, parent, io),
             ast::Expr::Subshell(s) => {
@@ -1479,7 +1491,7 @@ impl Interpreter {
     }
 
     /// Appends the value of `$N` to
-    /// `out`. Takes the relevant interpreter fields by-part so callers can
+    /// `out`, and returns whether `$N` is set. Takes the relevant interpreter fields by-part so callers can
     /// split-borrow alongside the node arena.
     ///
     /// # Safety
@@ -1491,7 +1503,7 @@ impl Interpreter {
         event_loop: EventLoopHandle,
         command_ctx: *mut bun_options_types::context::ContextData,
         vm_args_utf8: &mut Vec<bun_core::Utf8Bytes<'static>>,
-    ) {
+    ) -> bool {
         let mut int = original_int;
         match event_loop {
             EventLoopHandle::Js { .. } => {
@@ -1499,7 +1511,7 @@ impl Interpreter {
                     if let Ok(p) = bun_core::self_exe_path() {
                         out.extend_from_slice(p.as_bytes());
                     }
-                    return;
+                    return true;
                 }
                 int -= 1;
 
@@ -1507,7 +1519,7 @@ impl Interpreter {
                     .bun_vm()
                     .cast::<bun_jsc::virtual_machine::VirtualMachine>();
                 if vm_ptr.is_null() {
-                    return;
+                    return false;
                 }
                 // SAFETY: `bun_vm()` on a JS event loop returns the live
                 // `*VirtualMachine` owning that loop.
@@ -1515,7 +1527,7 @@ impl Interpreter {
                 if let Some(main) = vm.main() {
                     if int == 0 {
                         out.extend_from_slice(main);
-                        return;
+                        return true;
                     }
                     int -= 1;
                 }
@@ -1526,7 +1538,7 @@ impl Interpreter {
                     let worker = unsafe { &*worker_ptr.cast::<bun_jsc::web_worker::WebWorker>() };
                     let argv = worker.argv();
                     if int as usize >= argv.len() {
-                        return;
+                        return false;
                     }
                     if vm_args_utf8.len() != argv.len() {
                         vm_args_utf8.reserve(argv.len());
@@ -1536,30 +1548,33 @@ impl Interpreter {
                         }
                     }
                     out.extend_from_slice(vm_args_utf8[int as usize].slice());
-                    return;
+                    return true;
                 }
 
                 if (int as usize) < vm.argv.len() {
                     out.extend_from_slice(&vm.argv[int as usize]);
+                    return true;
                 }
+                false
             }
             EventLoopHandle::Mini(_) => {
                 if command_ctx.is_null() {
-                    return;
+                    return false;
                 }
                 // SAFETY: `command_ctx` is the process-global `ContextData`
                 // (see `init`); it outlives the interpreter.
                 let ctx = unsafe { &*command_ctx };
                 if int as usize > ctx.passthrough.len() {
-                    return;
+                    return false;
                 }
                 if int == 0 {
                     if let Some(last) = ctx.positionals.last() {
                         out.extend_from_slice(last);
                     }
-                    return;
+                    return true;
                 }
                 out.extend_from_slice(&ctx.passthrough[int as usize - 1]);
+                true
             }
         }
     }
