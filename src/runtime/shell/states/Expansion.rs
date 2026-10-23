@@ -511,11 +511,12 @@ impl Expansion {
         let cwd: Vec<u8>;
         {
             let me = interp.as_expansion_mut(this);
+            // A `ParamSpace` ended the last argument.
+            let nothing_left = me.current_out.is_empty() && !me.out.buf.is_empty();
             // The word of a `${NAME<op>word}` is not a pattern in its child `Expansion`: a `*` in it is text there.
             let is_param_word = matches!(interp.node(me.base.parent), Node::Expansion(_));
-            if is_param_word || !Self::has_glob_syntax(me) {
-                // A `ParamSpace` can leave no argument to end here.
-                if !me.current_out.is_empty() || me.out.buf.is_empty() {
+            if nothing_left || is_param_word || !Self::has_glob_syntax(me) {
+                if !nothing_left {
                     Self::push_current_out(me);
                 }
                 me.state = ExpansionState::Done;

@@ -39,6 +39,57 @@ describe.concurrent("run-shell", () => {
   });
 });
 
+// Bun's shell runs package.json scripts by default on Windows. The system
+// shell rows show that both shells give the same output.
+describe.each(isWindows ? ["bun"] : ["bun", "system"])("package script with --shell=%s", shell => {
+  const run = async (script: string, env: Record<string, string>, ...args: string[]) => {
+    using dir = tempDir("run-shell-braced", {
+      "package.json": JSON.stringify({ name: "braced-fixture", version: "1.2.3", scripts: { braced: script } }),
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "run", `--shell=${shell}`, "braced", ...args],
+      cwd: String(dir),
+      env: { ...bunEnv, ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  };
+
+  test("expands ${NAME}", async () => {
+    const { stdout, exitCode } = await run(
+      'echo ${BRACED_NAME} "${BRACED_VERSION}" ${npm_lifecycle_event}-x',
+      { BRACED_NAME: "braced-fixture", BRACED_VERSION: "1.2.3" },
+      "${BRACED_NAME}",
+    );
+    // The argument after the script name is data. It stays text.
+    expect(stdout).toBe("braced-fixture 1.2.3 braced-x ${BRACED_NAME}\n");
+    expect(exitCode).toBe(0);
+  });
+
+  test("expands ${NAME:-word} and ${NAME:+word}", async () => {
+    const script = "echo --port ${BRACED_PORT:-3002} ${BRACED_HOST:+--host $BRACED_HOST} ${BRACED_NONE:+--none}";
+    expect(await run(script, { BRACED_HOST: "localhost" })).toMatchObject({
+      stdout: "--port 3002 --host localhost\n",
+      exitCode: 0,
+    });
+    expect(await run(script, { BRACED_PORT: "8080" })).toMatchObject({ stdout: "--port 8080\n", exitCode: 0 });
+  });
+
+  test("a ${NAME:?} guard stops the script when NAME is not set", async () => {
+    const script = 'true "${BRACED_DEPLOY_ENV:?}" && echo deploying to $BRACED_DEPLOY_ENV';
+    const unset = await run(script, {});
+    expect(unset.stderr).toContain("BRACED_DEPLOY_ENV: parameter");
+    expect(unset.stdout).toBe("");
+    expect(unset.exitCode).not.toBe(0);
+    expect(await run(script, { BRACED_DEPLOY_ENV: "staging" })).toMatchObject({
+      stdout: "deploying to staging\n",
+      exitCode: 0,
+    });
+  });
+});
+
 test.skipIf(isWindows)(
   "package script shell interpreter is resolved from the original PATH, not node_modules/.bin",
   async () => {

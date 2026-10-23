@@ -27,6 +27,28 @@ describe("bun exec", () => {
     .stdout('hi "there bud"\n')
     .runAsTest("it works2");
 
+  TestBuilder.command`${BUN} exec ${'FOO=bar; echo ${FOO} "${FOO}" ${FOO}baz'}`
+    .env(bunEnv)
+    .stdout("bar bar barbaz\n")
+    .runAsTest("expands ${NAME}");
+
+  TestBuilder.command`${BUN} exec ${'FOO=bar; echo ${FOO:-none} ${NONE:-"a  b"} ${FOO:+set}; echo ${NONE:=made} $NONE'}`
+    .env(bunEnv)
+    .stdout("bar a  b set\nmade made\n")
+    .runAsTest("expands ${NAME<op>word}");
+
+  TestBuilder.command`${BUN} exec ${'true "${NONE:?need NONE}" && echo RAN'}`
+    .env(bunEnv)
+    .stderr("bun: NONE: need NONE\n")
+    .exitCode(1)
+    .runAsTest("${NAME:?word} fails the command when NAME is not set");
+
+  TestBuilder.command`${BUN} script.sh`
+    .file("script.sh", 'FOO=bar\necho ${FOO} "${FOO}" ${FOO}baz ${NONE:-é ${FOO:+ü}}\n')
+    .env(bunEnv)
+    .stdout("bar bar barbaz é ü\n")
+    .runAsTest("expands ${NAME} and ${NAME<op>word} in a .sh file");
+
   TestBuilder.command`${BUN} exec ${"cat filename"}`
     .file(
       "filename",

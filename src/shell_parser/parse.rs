@@ -3739,6 +3739,8 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
     fn lex_param_word(&mut self, quoted: bool) -> Result<(), LexerError> {
         let base_state = self.chars.state;
         let mut in_inner_quotes = false;
+        // How many `${` in the word are text, with a `}` that is text too and does not end the form.
+        let mut text_braces: u32 = 0;
         loop {
             let Some(input) = self.eat() else {
                 self.add_error(b"Unclosed parameter expansion");
@@ -3763,8 +3765,10 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                 }
             } else {
                 let state = self.chars.state;
+                let ends_form = state == base_state && !in_inner_quotes;
                 match u8::try_from(char).unwrap_or(0) {
-                    b'}' if state == base_state && !in_inner_quotes => {
+                    b'}' if ends_form && text_braces > 0 => text_braces -= 1,
+                    b'}' if ends_form => {
                         self.break_word(AddDelimiter::No)?;
                         self.tokens.push(Token::ParamEnd);
                         return Ok(());
@@ -3811,7 +3815,9 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                         let var_tok = self.eat_var()?;
                         match var_tok.len() {
                             0 => {
-                                if !(self.at_braced_param() && self.eat_braced_param()?) {
+                                let at_brace = self.at_braced_param();
+                                if !(at_brace && self.eat_braced_param()?) {
+                                    text_braces += u32::from(at_brace && ends_form);
                                     self.append_char_to_str_pool(u32::from(b'$'))?;
                                     self.break_word(AddDelimiter::No)?;
                                 }

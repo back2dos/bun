@@ -511,6 +511,89 @@ describe("parse shell", () => {
     expect(result).toEqual(expected);
   });
 
+  // `${` in a JS template literal starts an interpolation, so the sources
+  // here go to the parser as a raw array.
+  describe("${...}", () => {
+    const cmd = (source: string) => JSON.parse(parse({ raw: [source] })).stmts[0].exprs[0].cmd;
+    const args = (source: string) => cmd("echo " + source).name_and_args.slice(1);
+    const word = (atoms: object[], glob_hint = false) => ({
+      compound: { atoms, brace_expansion_hint: false, glob_hint },
+    });
+    const param = (name: string, op: string, wordAtoms: object[], { quoted = false, glob_hint = false } = {}) => ({
+      param: { name, op, quoted, word: word(wordAtoms, glob_hint) },
+    });
+
+    test("${NAME} is the atom of $NAME", () => {
+      expect(args("${X} ${1} a${X}b")).toEqual([
+        { simple: { Var: "X" } },
+        { simple: { VarArgv: 1 } },
+        word([{ Text: "a" }, { Var: "X" }, { Text: "b" }]),
+      ]);
+    });
+
+    test.each([":-", "-", ":+", "+", ":=", "=", ":?", "?"])("${NAME%sword}", op => {
+      expect(args("${X" + op + "a}")).toEqual([{ simple: param("X", op, [{ Text: "a" }]) }]);
+    });
+
+    test("the parameter, the quotes and the parts of the word", () => {
+      expect(args('"${1:?no $Y}" a${X:-}b ${X:-\'\'"q"$(echo)}')).toEqual([
+        {
+          simple: {
+            param: { argv: 1, op: ":?", quoted: true, word: word([{ Text: "no " }, { Var: "Y" }]) },
+          },
+        },
+        word([{ Text: "a" }, param("X", ":-", []), { Text: "b" }]),
+        {
+          simple: param("X", ":-", [
+            { quoted_empty: {} },
+            { Text: "q" },
+            { cmd_subst: { script: cmd("echo") && { stmts: [{ exprs: [{ cmd: cmd("echo") }] }] }, quoted: false } },
+          ]),
+        },
+      ]);
+    });
+
+    test("a word with whitespace or a * gives its atom the glob hint", () => {
+      expect(args("${X:-a b} ${X:-*} x${Y:+${X:-a b}}")).toEqual([
+        word([param("X", ":-", [{ Text: "a" }, { param_space: " " }, { Text: "b" }], { glob_hint: true })], true),
+        word([param("X", ":-", [{ asterisk: {} }], { glob_hint: true })], true),
+        word(
+          [
+            { Text: "x" },
+            param(
+              "Y",
+              ":+",
+              [param("X", ":-", [{ Text: "a" }, { param_space: " " }, { Text: "b" }], { glob_hint: true })],
+              { glob_hint: true },
+            ),
+          ],
+          true,
+        ),
+      ]);
+      expect(args('"${X:-a b}" "${X:-*}"')).toEqual([
+        { simple: param("X", ":-", [{ Text: "a b" }], { quoted: true }) },
+        { simple: param("X", ":-", [{ Text: "*" }], { quoted: true }) },
+      ]);
+    });
+
+    test("a tilde starts the word", () => {
+      expect(args('${X:-~/a~} ${X:-a~} "${X:-~}"')).toEqual([
+        { simple: param("X", ":-", [{ tilde: {} }, { Text: "/a~" }]) },
+        { simple: param("X", ":-", [{ Text: "a~" }]) },
+        { simple: param("X", ":-", [{ Text: "~" }], { quoted: true }) },
+      ]);
+    });
+
+    test("in an assignment value and a redirect target", () => {
+      const parsed = cmd("A=${X:-a} B=b${X:+c} echo > ${Y:-f}");
+      expect(parsed.assigns).toEqual([
+        { label: "A", value: { simple: param("X", ":-", [{ Text: "a" }]) } },
+        { label: "B", value: word([{ Text: "b" }, param("X", ":+", [{ Text: "c" }])]) },
+      ]);
+      expect(parsed.redirect_file).toEqual({ atom: { simple: param("Y", ":-", [{ Text: "f" }]) } });
+    });
+  });
+
   describe("if_clause", () => {
     test("basic", () => {
       const expected = {
