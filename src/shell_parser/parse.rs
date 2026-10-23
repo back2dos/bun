@@ -2366,7 +2366,7 @@ impl Lexed<'_> {
 /// Lexes `src`. With `param_heads`, `${NAME}` and `${NAME<op>word}` are read.
 ///
 /// When a pass with `param_heads` reads such a form and the script then fails to lex or to parse, lex the script
-/// again without `param_heads`: its tokens and its errors are then what they were before these forms were read.
+/// again without `param_heads`. Every `${` is then text, so reading these forms makes no script fail.
 pub fn lex<'bump>(
     bump: &'bump Bump,
     src: &'bump [u8],
@@ -2375,9 +2375,13 @@ pub fn lex<'bump>(
     param_heads: bool,
 ) -> Lexed<'bump> {
     fn pass<'bump, const ENCODING: StringEncoding>(
-        mut lexer: Lexer<'bump, ENCODING>,
+        bump: &'bump Bump,
+        src: &'bump [u8],
+        strings_to_escape: &'bump [BunString],
+        jsobjs_len: u32,
         param_heads: bool,
     ) -> Lexed<'bump> {
+        let mut lexer = Lexer::<ENCODING>::new(bump, src, strings_to_escape, jsobjs_len);
         lexer.param_heads = param_heads;
         let result = lexer.lex();
         let saw_param_head = lexer.saw_param_head;
@@ -2387,15 +2391,9 @@ pub fn lex<'bump>(
         }
     }
     if is_all_ascii(src) {
-        pass(
-            LexerAscii::new(bump, src, strings_to_escape, jsobjs_len),
-            param_heads,
-        )
+        pass::<{ StringEncoding::Ascii }>(bump, src, strings_to_escape, jsobjs_len, param_heads)
     } else {
-        pass(
-            LexerUnicode::new(bump, src, strings_to_escape, jsobjs_len),
-            param_heads,
-        )
+        pass::<{ StringEncoding::Wtf8 }>(bump, src, strings_to_escape, jsobjs_len, param_heads)
     }
 }
 
@@ -2488,7 +2486,7 @@ pub struct Lexer<'bump, const ENCODING: StringEncoding> {
     /// Number of JS object references expected (for bounds validation)
     pub(crate) jsobjs_len: u32,
 
-    /// `${NAME}` and `${NAME<op>word}` are read. When off, a `${` is text, as it was before these forms.
+    /// `${NAME}` and `${NAME<op>word}` are read. When off, a `${` is text.
     pub(crate) param_heads: bool,
     /// One of these forms was read.
     pub(crate) saw_param_head: bool,
@@ -3893,7 +3891,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         Ok(())
     }
 
-    // Inlined so that the `$` arm of `lex` stays free of a call now that `lex_param_word` is a second caller.
+    // `lex` runs this for each `$`. With the second caller (`lex_param_word`), the inliner leaves a call there.
     #[inline(always)]
     fn eat_var(&mut self) -> Result<TextRange, LexerError> {
         let start = self.j;
@@ -4285,6 +4283,8 @@ impl<'a, const ENCODING: StringEncoding> ShellCharIter<'a, ENCODING> {
 
 /// Whether `src` ends in the head of a parameter expansion: `$NAME`, `${`, `${NAME`, `${NAME:` or `${NAME<op>`.
 /// Text added there would name the parameter, choose the operator or start the word.
+// The `$` tag runs this for each interpolated value: inlined into the builder, which is in another crate.
+#[inline]
 pub fn ends_in_param_head(src: &[u8]) -> bool {
     let Some(last) = src
         .iter()

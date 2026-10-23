@@ -1511,7 +1511,7 @@ impl Interpreter {
     /// # Safety
     /// `command_ctx` must be null or point to a live `ContextData` that
     /// outlives this call.
-    // Inlined so that the `$N` arm of `Expansion` stays free of a call now that `${N<op>word}` is a second caller.
+    // `Expansion` runs this for each `$N`. With the second caller (`${N<op>word}`), the inliner leaves a call there.
     #[inline(always)]
     pub(crate) fn append_var_argv(
         out: &mut Vec<u8>,
