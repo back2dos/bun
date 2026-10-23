@@ -479,25 +479,11 @@ impl Expansion {
         pattern
     }
 
-    /// Whether the word has a `*` of the script. The `*` of a `${NAME<op>word}` is one only when the word is the result.
+    /// Whether the field in `current_out` has a `*` of the script. The hint of the atom is for the whole word.
     fn has_glob_syntax(me: &Expansion) -> bool {
-        let is_glob = |atom: &ast::SimpleAtom| {
-            matches!(
-                atom,
-                ast::SimpleAtom::Asterisk | ast::SimpleAtom::DoubleAsterisk
-            )
-        };
-        let node = me.node;
-        match node.get() {
-            ast::Atom::Simple(simple) => is_glob(simple),
-            ast::Atom::Compound(compound) => {
-                compound.atoms.iter().any(is_glob)
-                    || me
-                        .meta_offsets
-                        .iter()
-                        .any(|&offset| me.current_out.get(offset as usize) == Some(&b'*'))
-            }
-        }
+        me.meta_offsets
+            .iter()
+            .any(|&offset| me.current_out[offset as usize] == b'*')
     }
 
     /// Kick off an off-thread
@@ -508,7 +494,7 @@ impl Expansion {
         let cwd: Vec<u8>;
         {
             let me = interp.as_expansion_mut(this);
-            if me.current_out.is_empty() || !Self::has_glob_syntax(me) {
+            if !Self::has_glob_syntax(me) {
                 Self::push_current_out(me);
                 me.state = ExpansionState::Done;
                 return Yield::Next(this);

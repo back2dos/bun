@@ -1909,6 +1909,15 @@ booga"
         expect([await run("$A"), await run("${A}"), await run("${A:-none}")]).toEqual(["[]\n", "[]\n", "[none]\n"]);
       });
 
+      // `$` reads the raw template, so an escaped `${` is text. A `{ raw }` value carries a form.
+      test("in a template literal", async () => {
+        const { stdout, stderr, exitCode } =
+          await $`FOO=bar; echo \${FOO} \${FOO:-d} "\${NONE:?}" ${{ raw: "${FOO:-d} ${NONE:-d}" }}`.quiet();
+        expect(stderr.toString()).toBe("");
+        expect(stdout.toString()).toBe("${FOO} ${FOO:-d} ${NONE:?} bar d\n");
+        expect(exitCode).toBe(0);
+      });
+
       test("reads an environment set with .env()", async () => {
         const words = { raw: "${FOO:-none} ${BAR:-none} ${FOO:+set}" };
         const { stdout, stderr, exitCode } = await $`echo ${words}`.env({ ...bunEnv, FOO: "bar" });

@@ -1261,13 +1261,14 @@ describe("lex shell", () => {
       const syntax = (source: string[], value: string) => {
         try {
           return JSON.parse(lex({ raw: source }, value))
-            .map((token: object) => Object.keys(token)[0])
-            .filter((kind: string) => !kind.endsWith("Text"));
+            .filter((token: object) => !Object.keys(token)[0].endsWith("Text"))
+            .map((token: object) => ("Var" in token || "ParamBegin" in token ? token : Object.keys(token)[0]));
         } catch (error) {
           return String(error);
         }
       };
-      const alphabet = ["{", "}", "?", ":", "-", "+", "=", "a", "1", "#", "!", "@", '"'];
+      // A byte that the lexer learns to read after `${NAME` must be here, and in `ends_in_param_head`.
+      const alphabet = ["{", "}", "?", ":", "-", "+", "=", "a", "1", "#", "!", "@", '"', "%", "/", "^"];
       const short = ["", ...alphabet, ...alphabet.flatMap(first => alphabet.map(second => first + second))];
       const tails = ["", "{a", "{1"].flatMap(head => short.map(tail => head + tail));
       const differences = tails.filter(tail => {

@@ -43,6 +43,19 @@ describe("bun exec", () => {
     .exitCode(1)
     .runAsTest("${NAME:?word} fails the command when NAME is not set");
 
+  TestBuilder.command`${BUN} exec ${"ENV=${NONE:?} echo cmd"}`
+    .env(bunEnv)
+    .stderr("bun: NONE: parameter null or not set\n")
+    .exitCode(1)
+    .runAsTest("${NAME:?word} in an assignment before a command");
+
+  TestBuilder.command`${BUN} script.sh`
+    .file("script.sh", "ENV=${NONE:?need NONE}\n")
+    .env(bunEnv)
+    .stderr("bun: NONE: need NONE\n")
+    .exitCode(1)
+    .runAsTest("${NAME:?word} in an assignment in a .sh file");
+
   TestBuilder.command`${BUN} script.sh`
     .file("script.sh", 'FOO=bar\necho ${FOO} "${FOO}" ${FOO}baz ${NONE:-é ${FOO:+ü}}\n')
     .env(bunEnv)

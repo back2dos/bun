@@ -77,6 +77,15 @@ describe.each(isWindows ? ["bun"] : ["bun", "system"])("package script with --sh
     expect(await run(script, { BRACED_PORT: "8080" })).toMatchObject({ stdout: "--port 8080\n", exitCode: 0 });
   });
 
+  test("a ${NAME:?} guard in an assignment stops the command", async () => {
+    const script = "ENV=${BRACED_DEPLOY_ENV:?} echo deploying";
+    const unset = await run(script, {});
+    expect(unset.stderr).toContain("BRACED_DEPLOY_ENV: parameter");
+    expect(unset.stdout).toBe("");
+    expect(unset.exitCode).not.toBe(0);
+    expect(await run(script, { BRACED_DEPLOY_ENV: "staging" })).toMatchObject({ stdout: "deploying\n", exitCode: 0 });
+  });
+
   test("a ${NAME:?} guard stops the script when NAME is not set", async () => {
     const script = 'true "${BRACED_DEPLOY_ENV:?}" && echo deploying to $BRACED_DEPLOY_ENV';
     const unset = await run(script, {});
