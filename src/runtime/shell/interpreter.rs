@@ -174,6 +174,22 @@ impl Node {
             Node::Subshell(s) => Some(&mut s.base),
         }
     }
+
+    /// The streams of a state. `Assigns` and `Expansion` have none of their own.
+    pub(crate) fn io(&self) -> Option<&IO> {
+        match self {
+            Node::Free | Node::Assigns(_) | Node::Expansion(_) => None,
+            Node::Script(s) => Some(&s.io),
+            Node::Stmt(s) => Some(&s.io),
+            Node::Binary(s) => Some(&s.io),
+            Node::Pipeline(s) => Some(&s.io),
+            Node::Cmd(s) => Some(&s.io),
+            Node::If(s) => Some(&s.io),
+            Node::CondExpr(s) => Some(&s.io),
+            Node::Async(s) => Some(&s.io),
+            Node::Subshell(s) => Some(&s.io),
+        }
+    }
 }
 
 /// Generate `Interpreter::as_<kind>{,_mut}` typed accessors. These panic on
@@ -980,9 +996,7 @@ impl Interpreter {
             ast::Expr::Cmd(c) => Cmd::init(self, shell, *c, parent, io),
             ast::Expr::Binary(b) => Binary::init(self, shell, *b, parent, io),
             ast::Expr::Pipeline(p) => Pipeline::init(self, shell, *p, parent, io),
-            ast::Expr::Assign(a) => {
-                Assigns::init(self, shell, *a, parent, AssignCtx::Shell, Some(io))
-            }
+            ast::Expr::Assign(a) => Assigns::init(self, shell, *a, parent, AssignCtx::Shell),
             ast::Expr::If(i) => If::init(self, shell, *i, parent, io),
             ast::Expr::CondExpr(c) => CondExpr::init(self, shell, *c, parent, io),
             ast::Expr::Subshell(s) => {
@@ -1497,6 +1511,8 @@ impl Interpreter {
     /// # Safety
     /// `command_ctx` must be null or point to a live `ContextData` that
     /// outlives this call.
+    // Inlined so that the `$N` arm of `Expansion` stays free of a call now that `${N<op>word}` is a second caller.
+    #[inline(always)]
     pub(crate) fn append_var_argv(
         out: &mut Vec<u8>,
         original_int: u8,

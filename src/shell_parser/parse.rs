@@ -1707,10 +1707,19 @@ impl<'bump> Parser<'bump> {
                     }
                     Token::ParamBegin { .. } => {
                         let param = self.parse_param()?;
-                        has_glob_syntax |= param.word.has_glob_expansion();
+                        let ends_argument = param.word.has_glob_expansion();
+                        has_glob_syntax |= ends_argument;
                         atoms.push(ast::SimpleAtom::Param(param));
                         if self.delimits(self.peek()) {
                             let _ = self.r#match(TokenTag::Delimit);
+                            // The hint is a field of a compound atom, so this lone `Param` is one.
+                            if ends_argument && atoms.len() == 1 {
+                                return Ok(Some(ast::Atom::Compound(ast::CompoundAtom {
+                                    atoms: atoms.into_bump_slice(),
+                                    brace_expansion_hint: false,
+                                    glob_hint: true,
+                                })));
+                            }
                             break;
                         }
                     }
@@ -1745,16 +1754,9 @@ impl<'bump> Parser<'bump> {
             }
         }
 
-        // A lone `Param` whose word can end an argument needs the hint of a compound atom.
-        let lone_param_with_hint = matches!(
-            atoms[..],
-            [ast::SimpleAtom::Param(param)] if param.word.has_glob_expansion()
-        );
         Ok(match atoms.len() {
             0 => None,
-            1 if !lone_param_with_hint => {
-                Some(ast::Atom::new_simple(atoms.into_iter().next().unwrap()))
-            }
+            1 => Some(ast::Atom::new_simple(atoms.into_iter().next().unwrap())),
             _ => Some(ast::Atom::Compound(ast::CompoundAtom {
                 atoms: atoms.into_bump_slice(),
                 brace_expansion_hint: has_brace_open && has_brace_close && has_comma,
@@ -1892,6 +1894,9 @@ impl<'bump> Parser<'bump> {
         IfClauseTok::from_text(self.text(range))
     }
 
+    // `parse_atom` runs `advance`, `is_at_end` and `r#match` for each word. Left to the inliner, they stay calls in
+    // the arms that it rates cold.
+    #[inline(always)]
     fn advance(&mut self) -> Token {
         if !self.is_at_end() {
             self.current += 1;
@@ -1899,6 +1904,7 @@ impl<'bump> Parser<'bump> {
         self.prev()
     }
 
+    #[inline(always)]
     fn is_at_end(&self) -> bool {
         self.peek().tag() == TokenTag::Eof
             || (self.inside_subshell.is_some()
@@ -1971,6 +1977,7 @@ impl<'bump> Parser<'bump> {
     }
 
     /// Consumes token if it matches
+    #[inline(always)]
     fn r#match(&mut self, toktag: TokenTag) -> bool {
         if self.peek().tag() == toktag {
             let _ = self.advance();
@@ -3885,6 +3892,8 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         Ok(())
     }
 
+    // Inlined so that the `$` arm of `lex` stays free of a call now that `lex_param_word` is a second caller.
+    #[inline(always)]
     fn eat_var(&mut self) -> Result<TextRange, LexerError> {
         let start = self.j;
         let mut i: usize = 0;

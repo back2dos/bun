@@ -3,7 +3,7 @@
 
 use crate::shell::ast;
 use crate::shell::interpreter::{Interpreter, Node, NodeId, ShellExecEnv, log};
-use crate::shell::io::{IO, OutKind};
+use crate::shell::io::OutKind;
 use crate::shell::io_writer;
 use crate::shell::states::base::Base;
 use crate::shell::states::expansion::Expansion;
@@ -23,10 +23,6 @@ pub(crate) struct Assigns {
     pub node: bun_ptr::RawSlice<ast::Assign>,
     pub(crate) state: AssignsState,
     pub ctx: AssignCtx,
-    /// A statement of assignments writes the error of a value to its stderr. The prefix assignments of a `Cmd` have
-    /// no `io`: the `Cmd` takes the error with `take_err` and writes it.
-    io: Option<IO>,
-    err: Option<Box<ShellErr>>,
 }
 
 #[derive(Default)]
@@ -48,7 +44,6 @@ impl Assigns {
         node: &[ast::Assign],
         parent: NodeId,
         ctx: AssignCtx,
-        io: Option<IO>,
     ) -> NodeId {
         interp.alloc_node(Node::Assigns(Assigns {
             base: Base::new(parent, shell),
@@ -56,8 +51,6 @@ impl Assigns {
             node: bun_ptr::RawSlice::new(node),
             state: AssignsState::Idle,
             ctx,
-            io,
-            err: None,
         }))
     }
 
@@ -150,14 +143,15 @@ impl Assigns {
         Yield::Next(this)
     }
 
-    /// A value did not expand. The assignments before it are made and the ones after it are not.
+    /// A value did not expand. The assignments before it are made and the ones after it are not. The error goes to
+    /// the stderr of the parent: a statement, or the `Cmd` of these prefix assignments.
     fn fail(interp: &Interpreter, this: NodeId, err: Option<ShellErr>) -> Yield {
-        let me = interp.as_assigns_mut(this);
-        let parent = me.base.parent;
-        let stderr = match &me.io {
-            Some(io) if err.is_some() => io.stderr.clone(),
+        let parent = interp.as_assigns(this).base.parent;
+        let stderr = match (&err, interp.node(parent).io()) {
+            (Some(_), Some(io)) => io.stderr.clone(),
             _ => OutKind::Ignore,
         };
+        let me = interp.as_assigns_mut(this);
         match (stderr, err) {
             (OutKind::Fd(fd), Some(err)) => {
                 me.state = AssignsState::WaitingWriteErr;
@@ -173,18 +167,11 @@ impl Assigns {
                 me.state = AssignsState::Done;
                 interp.child_done(parent, this, 1)
             }
-            (_, err) => {
-                // With no `io`, the `Cmd` of these prefix assignments writes the error.
-                me.err = err.map(Box::new);
+            _ => {
                 me.state = AssignsState::Done;
                 interp.child_done(parent, this, 1)
             }
         }
-    }
-
-    /// The error of a value of the prefix assignments of a `Cmd`, for that `Cmd` to write.
-    pub(crate) fn take_err(interp: &Interpreter, this: NodeId) -> Option<ShellErr> {
-        interp.as_assigns_mut(this).err.take().map(|err| *err)
     }
 
     /// IOWriter completion callback for the error written in `WaitingWriteErr`: on write failure finish with the

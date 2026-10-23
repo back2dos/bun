@@ -251,8 +251,7 @@ impl Cmd {
                 CmdState::Idle => {
                     if !n.assigns.is_empty() {
                         interp.as_cmd_mut(this).state = CmdState::ExpandingAssigns;
-                        let child =
-                            Assigns::init(interp, shell, n.assigns, this, AssignCtx::Cmd, None);
+                        let child = Assigns::init(interp, shell, n.assigns, this, AssignCtx::Cmd);
                         return Assigns::start(interp, child);
                     }
                     interp.as_cmd_mut(this).state = CmdState::ExpandingRedirect { idx: 0 };
@@ -340,7 +339,7 @@ impl Cmd {
             let err = if matches!(child_kind, StateKind::Expansion) {
                 Expansion::take_err(interp, child)
             } else {
-                Assigns::take_err(interp, child)
+                None
             };
             interp.deinit_node(child);
             if let Some(err) = err {
