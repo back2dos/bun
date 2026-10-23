@@ -34,28 +34,35 @@ impl Default for RequestedExports {
     }
 }
 
-/// Dev server: the barrels that have deferred a record, by graph and source path.
+/// Dev server: the barrels that have deferred a record, by side of the module
+/// graph and by source path.
 ///
 /// A build of the dev server parses only the new and the changed files, so
-/// `requested_exports` lacks what the modules of earlier builds read. For the life
-/// of the server, each graph's copy of a barrel is therefore in one of two states:
-/// - `Partial`: the copy that the dev server serves can have a deferred record.
-///   Every build that reaches the barrel parses it again (`must_reparse`), so each
-///   request is in `requested_exports` of that build, and
-///   `persist_requests_of_tracked_barrels` adds those requests to this set.
-/// - `All`, or no entry while the graph already has the file: every record of the
-///   served copy is live, and `apply_barrel_optimization` defers none of them
-///   again. Such a barrel is cached like any other module, so a build that skips
-///   it records no request for it.
+/// `requested_exports` lacks what the modules of earlier builds read. A barrel
+/// with an entry here is therefore parsed in every build that reaches it
+/// (`must_reparse`), and `persist_requests_of_tracked_barrels` adds the requests
+/// of each build to its entry:
+/// - `Partial`: the names that the builds so far requested. The other records can
+///   stay deferred.
+/// - `All`: a build requested every export. No record is deferred again.
+///
+/// A barrel that has no entry and that the dev server already bundled never
+/// deferred a record. Builds took it from the cache and recorded no request for
+/// it, so `apply_barrel_optimization` defers none of its records either.
+///
+/// The key has the side because a copy that one side loaded in full has no entry,
+/// while the entry of the other side still makes every build parse it. The server
+/// and SSR copies of a file share one record and one list of imports in the dev
+/// server, so they share one entry.
 #[derive(Default)]
 pub struct TrackedBarrels {
-    by_graph: [StringArrayHashMap<RequestedExports>; 3],
+    by_side: [StringArrayHashMap<RequestedExports>; 2],
 }
 
 impl TrackedBarrels {
     #[inline]
-    fn get(&self, graph: bake_types::Graph, path: &[u8]) -> Option<&RequestedExports> {
-        let barrels = &self.by_graph[graph as usize];
+    fn get(&self, side: bake_types::Side, path: &[u8]) -> Option<&RequestedExports> {
+        let barrels = &self.by_side[side as usize];
         // A lookup hashes the path: skip it for the projects that track no barrel.
         if barrels.is_empty() {
             return None;
@@ -63,18 +70,23 @@ impl TrackedBarrels {
         barrels.get(path)
     }
 
-    /// True if a build that reaches this file has to parse it again. An importer of
-    /// one graph can read the copy of another graph (a client component boundary),
-    /// so a copy with a deferred record in any graph counts.
+    /// True if the copy of this file on `side` has an entry.
+    pub fn is_tracked(&self, side: bake_types::Side, path: &[u8]) -> bool {
+        self.get(side, path).is_some()
+    }
+
+    /// True if a build that reaches this file has to parse it again. An importer on
+    /// one side can read the copy of the other side (a client component boundary),
+    /// so an entry on either side counts.
     pub fn must_reparse(&self, path: &[u8]) -> bool {
-        self.by_graph.iter().any(|barrels| {
-            !barrels.is_empty() && matches!(barrels.get(path), Some(RequestedExports::Partial(_)))
-        })
+        self.by_side
+            .iter()
+            .any(|barrels| !barrels.is_empty() && barrels.contains_key(path))
     }
 
     pub fn memory_cost(&self) -> usize {
         let mut cost = 0;
-        for barrels in &self.by_graph {
+        for barrels in &self.by_side {
             cost += barrels.capacity()
                 * (size_of::<Box<[u8]>>() + size_of::<RequestedExports>() + size_of::<u32>());
             for (path, requested) in barrels.iter() {
@@ -106,6 +118,23 @@ impl RequestedExports {
     #[inline]
     fn lookup(map: &[Option<Self>], idx: u32) -> Option<&Self> {
         map.get(idx as usize).and_then(Option::as_ref)
+    }
+
+    /// Adds what `other` requests. Returns the number of names that are new.
+    fn add(&mut self, other: &Self) -> Result<usize, AllocError> {
+        let RequestedExports::Partial(kept) = self else {
+            return Ok(0);
+        };
+        let mut added = 0;
+        match other {
+            RequestedExports::All => *self = RequestedExports::All,
+            RequestedExports::Partial(names) => {
+                for name in names.keys() {
+                    added += !kept.get_or_put(name)?.found_existing as usize;
+                }
+            }
+        }
+        Ok(added)
     }
 }
 
@@ -245,11 +274,42 @@ fn apply_barrel_optimization_impl(
     // `DevServerHandle` is `Copy`; copied out so the `&self` borrow
     // doesn't conflict with later `&mut this.requested_exports`.
     let dev_handle = this.dev_server_handle().copied();
-    let graph = ast.target.bake_graph();
+    let side = ast.target.bake_graph().side();
     if let Some(dev) = dev_handle {
-        // SAFETY: `tracked_barrels` is owned by DevServer. Only the bundle thread
-        // reads or writes it, and only during a bundle.
-        match unsafe { &*dev.tracked_barrels() }.get(graph, result.source.path.text) {
+        // An importer records its request under the source index that its path map
+        // had for this file at that moment. A file that was not there to read, and
+        // that the build loads again, has a second index by now.
+        let sources = this.graph.input_files.items_source();
+        for (other, requested) in this.requested_exports.iter().enumerate() {
+            let Some(requested) = requested else {
+                continue;
+            };
+            if other == source_index as usize
+                || sources[other].path.text != result.source.path.text
+                || copy_side(this, other as u32).is_some_and(|other_side| other_side != side)
+            {
+                continue;
+            }
+            match requested {
+                RequestedExports::All => return Ok(()),
+                RequestedExports::Partial(partial) => {
+                    for key in partial.keys() {
+                        if let Some(resolution) =
+                            resolve_barrel_export(key, &ast.named_exports, &ast.named_imports)
+                        {
+                            needed_records.put(resolution.import_record_index, ())?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // SAFETY: `tracked_barrels` is a field of the DevServer, which outlives the
+        // bundle. This pass and `persist_requests_of_tracked_barrels` run on the JS
+        // thread and are its only writers. No reference made from the pointer is
+        // held across a call into the DevServer.
+        let is_tracked = match unsafe { &*dev.tracked_barrels() }.get(side, result.source.path.text)
+        {
             Some(RequestedExports::All) => return Ok(()),
             Some(RequestedExports::Partial(persisted)) => {
                 for alias in persisted.keys() {
@@ -259,14 +319,15 @@ fn apply_barrel_optimization_impl(
                         needed_records.put(resolution.import_record_index, ())?;
                     }
                 }
+                true
             }
-            // The dev server has this file and does not track it: every record of
-            // the served copy is live, and the builds that took that copy from the
-            // cache recorded no request for it.
-            None if dev.has_file(result.source.path.key_for_incremental_graph(), graph) => {
-                return Ok(());
-            }
-            None => {}
+            None => false,
+        };
+        // The dev server bundled this file and does not track it: no copy of it
+        // deferred a record, and the builds that took it from the cache recorded
+        // no request for it.
+        if !is_tracked && dev.has_file(result.source.path.key_for_incremental_graph(), side) {
+            return Ok(());
         }
     }
 
@@ -351,18 +412,32 @@ fn apply_barrel_optimization_impl(
         let _ = RequestedExports::entry(&mut this.requested_exports, source_index);
     }
 
-    if let Some(dev) = dev_handle {
+    if has_deferrals && let Some(dev) = dev_handle {
         // SAFETY: see the read of `tracked_barrels` above.
-        let barrels = &mut unsafe { &mut *dev.tracked_barrels() }.by_graph[graph as usize];
-        if has_deferrals {
-            barrels.get_or_put(result.source.path.text)?;
-        } else if let Some(requested) = barrels.get_mut(result.source.path.text) {
-            // Nothing is left to defer: the barrel can be cached.
-            *requested = RequestedExports::All;
-        }
+        unsafe { &mut *dev.tracked_barrels() }.by_side[side as usize]
+            .get_or_put(result.source.path.text)?;
     }
 
     Ok(())
+}
+
+/// Dev server: the side of the copy of a file that has this source index. A file
+/// that did not parse has no target of its own: the path map that has it tells
+/// the target that imported it. `None`: no path map has it, because the file was
+/// not there to read.
+fn copy_side(this: &BundleV2, source_index: u32) -> Option<bake_types::Side> {
+    let index = source_index as usize;
+    if this.graph.ast.items_parts()[index].len() != 0 {
+        return Some(this.graph.ast.items_target()[index].bake_graph().side());
+    }
+    let path = this.graph.input_files.items_source()[index].path.text;
+    this.graph
+        .build_graphs
+        .iter()
+        .find_map(|(target, path_to_source_index)| {
+            (path_to_source_index.get(path) == Some(source_index))
+                .then(|| target.bake_graph().side())
+        })
 }
 
 /// Dev server, once per build when every file is parsed: add what the files of this
@@ -372,51 +447,53 @@ pub(crate) fn persist_requests_of_tracked_barrels(
     this: &BundleV2,
     dev: &crate::dispatch::DevServerHandle,
 ) -> Result<(), AllocError> {
-    // SAFETY: `tracked_barrels` is owned by DevServer. Only the bundle thread
-    // reads or writes it, and only during a bundle.
+    // SAFETY: see the read of `tracked_barrels` in `apply_barrel_optimization_impl`.
     let tracked = unsafe { &mut *dev.tracked_barrels() };
-    let parts = this.graph.ast.items_parts();
-    let targets = this.graph.ast.items_target();
+    if tracked.by_side.iter().all(|barrels| barrels.is_empty()) {
+        return Ok(());
+    }
+    let sources = this.graph.input_files.items_source();
     let mut lookups: usize = 0;
     let mut names_added: usize = 0;
-    for (graph, barrels) in tracked.by_graph.iter_mut().enumerate() {
-        if barrels.is_empty() {
+    // A request is for the copy that it was recorded under. The path maps do not
+    // lead back to that copy: the bundler can give a path another source index
+    // within a build.
+    for (index, requested) in this.requested_exports.iter().enumerate() {
+        let Some(requested) = requested else {
             continue;
-        }
-        // A file is in the path map of the target that imported it.
-        for (map_target, path_to_source_index) in this.graph.build_graphs.iter() {
-            if path_to_source_index.map.is_empty() {
+        };
+        let side = copy_side(this, index as u32);
+        for (barrels_side, barrels) in tracked.by_side.iter_mut().enumerate() {
+            if barrels.is_empty() || side.is_some_and(|side| side as usize != barrels_side) {
                 continue;
             }
-            for entry in barrels.iterator() {
-                let RequestedExports::Partial(kept) = entry.value_ptr else {
-                    continue;
-                };
-                lookups += 1;
-                let Some(source_index) = path_to_source_index.get(&**entry.key_ptr) else {
-                    continue;
-                };
-                match RequestedExports::lookup(&this.requested_exports, source_index) {
-                    Some(RequestedExports::All) => {
-                        // The barrel pass or the BFS made every record of that copy
-                        // live. A file that failed to parse has no target of its own.
-                        let copy_target = if parts[source_index as usize].len() != 0 {
-                            targets[source_index as usize]
-                        } else {
-                            map_target
-                        };
-                        if copy_target.bake_graph() as usize == graph {
-                            *entry.value_ptr = RequestedExports::All;
-                        }
-                    }
-                    Some(RequestedExports::Partial(requested)) => {
-                        for name in requested.keys() {
-                            names_added += !kept.get_or_put(name)?.found_existing as usize;
-                        }
-                    }
-                    None => {}
-                }
+            lookups += 1;
+            if let Some(kept) = barrels.get_mut(sources[index].path.text) {
+                names_added += kept.add(requested)?;
             }
+        }
+    }
+    // The bundler points the path of a client component boundary at the copy that it
+    // generates for the other side. What a later importer of the build records under
+    // that copy is for the file itself.
+    let boundaries = this.graph.server_component_boundaries.slice();
+    for (&original, &generated) in boundaries
+        .list
+        .items_source_index()
+        .iter()
+        .zip(boundaries.list.items_reference_source_index())
+    {
+        let Some(requested) = RequestedExports::lookup(&this.requested_exports, generated) else {
+            continue;
+        };
+        let Some(side) = copy_side(this, original) else {
+            continue;
+        };
+        lookups += 1;
+        if let Some(kept) =
+            tracked.by_side[side as usize].get_mut(sources[original as usize].path.text)
+        {
+            names_added += kept.add(requested)?;
         }
     }
     bun_core::scoped_log!(

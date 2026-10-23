@@ -85,56 +85,57 @@ pub(crate) struct CacheEntry {
 
 impl DevServer {
     pub(crate) fn is_file_cached(&mut self, path: &[u8], side: bake::Graph) -> Option<CacheEntry> {
-        // A build has to record what its files request from a barrel with a deferred record.
+        // A build has to record what its files request from a barrel that has deferred a record.
         if self.tracked_barrels.must_reparse(path) {
             return None;
         }
 
         let _g = self.graph_safety_lock.guard();
-        let (file, is_stale) = self.file_in_graph(path, side)?;
-        if is_stale {
-            return None;
-        }
-        Some(CacheEntry {
-            kind: file.file_kind(),
-        })
-    }
 
-    /// True if the graph of `side` has a record of this file: a bundled copy, stale or not, or a failure.
-    pub(crate) fn has_file(&self, path: &[u8], side: bake::Graph) -> bool {
-        let _g = self.graph_safety_lock.guard();
-        self.file_in_graph(path, side).is_some()
-    }
-
-    /// The record of the file in the graph of `side`, and whether it is stale.
-    fn file_in_graph(
-        &self,
-        path: &[u8],
-        side: bake::Graph,
-    ) -> Option<(&incremental_graph::File, bool)> {
-        macro_rules! record {
-            ($g:expr) => {{
+        macro_rules! check {
+            ($g:expr, |$file:ident| $bundled_for_side:expr) => {{
                 let g = $g;
                 let index = g.bundled_files.get_index(path)?;
-                let file = g.get_file_by_index(incremental_graph::FileIndex::init(
+                if g.stale_files.is_set(index) {
+                    return None;
+                }
+                let $file = g.get_file_by_index(incremental_graph::FileIndex::init(
                     u32::try_from(index).expect("int cast"),
                 ));
-                (file, g.stale_files.is_set(index))
+                if !$bundled_for_side {
+                    return None;
+                }
+                return Some(CacheEntry {
+                    kind: $file.file_kind(),
+                });
             }};
         }
         match side {
-            bake::Graph::Client => Some(record!(&self.client_graph)),
+            bake::Graph::Client => check!(&self.client_graph, |_file| true),
             // The server and SSR graphs share one record per file. Only a JS record tracks which graph bundled it.
-            bake::Graph::Server | bake::Graph::Ssr => {
-                let (file, is_stale) = record!(&self.server_graph);
-                let bundled_for_side = file.file_kind() != FileKind::Js
+            bake::Graph::Server | bake::Graph::Ssr => check!(&self.server_graph, |file| {
+                file.file_kind() != FileKind::Js
                     || if side == bake::Graph::Ssr {
                         file.is_ssr
                     } else {
                         file.is_rsc
-                    };
-                bundled_for_side.then_some((file, is_stale))
-            }
+                    }
+            }),
+        }
+    }
+
+    /// True if an earlier build can have bundled a copy of this file for `side`. The copy can be stale or failed by now.
+    pub(crate) fn has_file(&self, path: &[u8], side: bake::Side) -> bool {
+        let _g = self.graph_safety_lock.guard();
+        match side {
+            // A failure resets the kind of a client record, so every record counts.
+            bake::Side::Client => self.client_graph.bundled_files.contains_key(path),
+            // Only a bundled copy gives a server record this kind, and a failure keeps it.
+            bake::Side::Server => self
+                .server_graph
+                .bundled_files
+                .get(path)
+                .is_some_and(|file| file.file_kind() == FileKind::Js),
         }
     }
 
