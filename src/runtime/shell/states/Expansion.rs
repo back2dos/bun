@@ -6,7 +6,8 @@
 
 use crate::shell::ast;
 use crate::shell::interpreter::{
-    EventLoopHandle, Interpreter, Node, NodeId, ShellExecEnv, ShellExecEnvKind, StateKind, log,
+    EnvMap, EventLoopHandle, Interpreter, Node, NodeId, ShellExecEnv, ShellExecEnvKind, StateKind,
+    log,
 };
 use crate::shell::io::{IO, OutKind};
 use crate::shell::states::assigns::{AssignCtx, AssignsState};
@@ -704,7 +705,7 @@ impl Expansion {
                 let in_prefix = ctx
                     .earlier_assigns
                     .iter()
-                    .any(|assign| assign.label == name);
+                    .any(|assign| EnvMap::is_same_name(assign.label, name));
                 let value = in_prefix
                     .then(|| shell.cmd_local_env.get(EnvStr::init_slice(name)))
                     .flatten()
