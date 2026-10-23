@@ -547,7 +547,7 @@ describe("parse shell", () => {
           simple: param("X", ":-", [
             { quoted_empty: {} },
             { Text: "q" },
-            { cmd_subst: { script: cmd("echo") && { stmts: [{ exprs: [{ cmd: cmd("echo") }] }] }, quoted: false } },
+            { cmd_subst: { script: { stmts: [{ exprs: [{ cmd: cmd("echo") }] }] }, quoted: false } },
           ]),
         },
       ]);

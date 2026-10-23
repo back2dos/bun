@@ -660,16 +660,16 @@ pub mod ast {
         }
     }
 
-    /// What a `${NAME<op>word}` does when the parameter is absent.
+    /// What the operator of a `${NAME<op>word}` does with the word. See [`ParamOp::is_absent`].
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub enum ParamAction {
-        /// `-`: the result is the word.
+        /// `-`: the word is the result when the parameter is absent.
         Default,
-        /// `+`: the result is the word when the parameter is present, else nothing.
+        /// `+`: the word is the result when the parameter is present. When it is absent the result is nothing.
         Alternate,
-        /// `=`: the word is assigned to the parameter.
+        /// `=`: when the parameter is absent, the word is assigned to it and is the result.
         Assign,
-        /// `?`: the command fails and the word is the message.
+        /// `?`: when the parameter is absent, the command fails and the word is the message.
         Error,
     }
 
@@ -3735,6 +3735,8 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
 
     /// Lexes the word of a `${NAME<op>word}` up to the `}` that ends the form. Operators are text in a word.
     /// In a `quoted` form the word is in double quotes, and a `}` between an inner pair of `"` does not end it.
+    ///
+    /// An error from here is not shown: the callers of [`lex`] lex the script again with every `${` as text.
     #[cold]
     fn lex_param_word(&mut self, quoted: bool) -> Result<(), LexerError> {
         let base_state = self.chars.state;
