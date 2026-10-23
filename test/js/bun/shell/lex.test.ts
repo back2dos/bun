@@ -1160,11 +1160,12 @@ describe("lex shell", () => {
 
     test("forms nest to the depth of $(...), and deeper forms are text", () => {
       const forms = (source: string) => tokens(source).filter((token: object) => "ParamBegin" in token);
-      const nested = (depth: number) => "${A:-".repeat(depth) + "x" + "}".repeat(depth);
+      const repeat = (text: string, count: number) => Buffer.alloc(text.length * count, text).toString();
+      const nested = (depth: number) => repeat("${A:-", depth) + "x" + repeat("}", depth);
       expect(forms(nested(128))).toHaveLength(128);
       expect(forms(nested(129))).toHaveLength(0);
       // A form counts as one level of $(...).
-      const inSubst = (depth: number) => "$(echo ".repeat(depth) + "${A:-x}" + ")".repeat(depth);
+      const inSubst = (depth: number) => repeat("$(echo ", depth) + "${A:-x}" + repeat(")", depth);
       expect(forms(inSubst(127))).toHaveLength(1);
       expect(forms(inSubst(128))).toHaveLength(0);
     });

@@ -1727,6 +1727,20 @@ booga"
           .stdout("after\n")
           .stderr("bun: U: one\nbun: U: two\n")
           .runAsTest("in the value of an assignment");
+        raw("VALUE=${U:?one}; VALUE=${U:?two} echo cmd; echo after")
+          .quiet()
+          .stdout("after\n")
+          .stderr("bun: U: one\nbun: U: two\n")
+          .runAsTest("in the value of an assignment, with .quiet()");
+        raw("A=1 B=${U:?stop} C=2; echo $A-$C; VALUE=${U:?one} || echo or")
+          .stdout("1-\nor\n")
+          .stderr("bun: U: stop\nbun: U: one\n")
+          .runAsTest("the assignments before it are made and the ones after it are not");
+        // 16 alternatives in each of 5 groups are 1048576 words, over the limit of 65536.
+        raw("VALUE=" + Buffer.alloc(33 * 5, "{a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p}").toString() + "; echo after")
+          .stdout("after\n")
+          .stderr("bun: too many brace expansions (1048576 > 65536)\n")
+          .runAsTest("another error in the value of an assignment is written too");
         raw("echo hi > ${U:?no file}.txt; echo ${U:-$(echo ${U:?inner})} after")
           .ensureTempDir()
           .stdout("after\n")
@@ -1767,11 +1781,12 @@ booga"
         .stdout("${U:-a} ${U:-b c}\nnext\n")
         .runAsTest("a form that does not end makes every form text");
       test("forms nest to the depth of $(...)", async () => {
-        const nested = (depth: number) => ({ raw: "${A:-".repeat(depth) + "x" + "}".repeat(depth) });
+        const repeat = (text: string, count: number) => Buffer.alloc(text.length * count, text).toString();
+        const nested = (depth: number) => ({ raw: repeat("${A:-", depth) + "x" + repeat("}", depth) });
         expect(await $`echo ${nested(128)}`.text()).toBe("x\n");
         expect(await $`echo ${nested(129)}`.text()).toBe(nested(129).raw + "\n");
         // A form counts as one level of $(...).
-        const inSubst = (depth: number) => ({ raw: "$(echo ".repeat(depth) + "${A:-x}" + ")".repeat(depth) });
+        const inSubst = (depth: number) => ({ raw: repeat("$(echo ", depth) + "${A:-x}" + repeat(")", depth) });
         expect(await $`echo ${inSubst(127)}`.text()).toBe("x\n");
         expect(await $`echo ${inSubst(128)}`.text()).toBe("${A:-x}\n");
       });
