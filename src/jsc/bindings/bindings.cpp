@@ -542,7 +542,7 @@ AsymmetricMatcherResult matchAsymmetricMatcherAndGetFlags(JSGlobalObject* global
                 for (unsigned n = 0; n < otherLength; n++) {
                     JSValue otherValue = otherArray->getIndex(globalObject, n);
                     RETURN_IF_EXCEPTION(throwScope, AsymmetricMatcherResult::FAIL);
-                    Vector<std::pair<JSValue, JSValue>, 16> stack;
+                    Bun::DeepEqualsStack stack;
                     MarkedArgumentBuffer gcBuffer;
                     bool foundNow = Bun__deepEquals<false, true, false>(globalObject, expectedValue, otherValue, gcBuffer, stack, throwScope, true);
                     RETURN_IF_EXCEPTION(throwScope, AsymmetricMatcherResult::FAIL);
@@ -709,7 +709,7 @@ JSValue getIndexWithoutAccessors(JSGlobalObject* globalObject, JSObject* obj, ui
 }
 
 template<bool isStrict, bool enableAsymmetricMatchers, bool checkPrototypes, bool skipPrototypeIdentity = false>
-std::optional<bool> specialObjectsDequal(JSC::JSGlobalObject* globalObject, MarkedArgumentBuffer& gcBuffer, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>& stack, ThrowScope& scope, JSCell* _Nonnull c1, JSCell* _Nonnull c2);
+std::optional<bool> specialObjectsDequal(JSC::JSGlobalObject* globalObject, MarkedArgumentBuffer& gcBuffer, Bun::DeepEqualsStack& stack, ThrowScope& scope, JSCell* _Nonnull c1, JSCell* _Nonnull c2);
 
 template<typename T>
 static bool looseFloatContentsEqual(std::span<const T> a, std::span<const T> b)
@@ -736,7 +736,7 @@ static ALWAYS_INLINE bool hasExtraOwnProperties(JSC::Structure* structure)
 // node compares the non-index own properties of typed arrays as well;
 // only the node entry point (checkPrototypes) pays for this.
 template<bool isStrict, bool enableAsymmetricMatchers, bool checkPrototypes, bool skipPrototypeIdentity = false>
-static bool nonIndexOwnPropertiesEqual(JSC::JSGlobalObject* globalObject, MarkedArgumentBuffer& gcBuffer, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>& stack, ThrowScope& scope, JSC::JSObject* o1, JSC::JSObject* o2)
+static bool nonIndexOwnPropertiesEqual(JSC::JSGlobalObject* globalObject, MarkedArgumentBuffer& gcBuffer, Bun::DeepEqualsStack& stack, ThrowScope& scope, JSC::JSObject* o1, JSC::JSObject* o2)
 {
     VM& vm = globalObject->vm();
     JSC::PropertyNameArrayBuilder a1(vm, PropertyNameMode::StringsAndSymbols, PrivateSymbolMode::Exclude);
@@ -823,7 +823,7 @@ static bool isWellKnownConstructor(JSValue value)
 }
 
 template<bool isStrict, bool enableAsymmetricMatchers, bool checkPrototypes, bool skipPrototypeIdentity>
-bool Bun__deepEquals(JSC::JSGlobalObject* globalObject, JSValue v1, JSValue v2, MarkedArgumentBuffer& gcBuffer, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>& stack, ThrowScope& scope, bool addToStack)
+bool Bun__deepEquals(JSC::JSGlobalObject* globalObject, JSValue v1, JSValue v2, MarkedArgumentBuffer& gcBuffer, Bun::DeepEqualsStack& stack, ThrowScope& scope, bool addToStack)
 {
     VM& vm = globalObject->vm();
     if (!vm.isSafeToRecurse()) [[unlikely]] {
@@ -1392,8 +1392,8 @@ struct DeepEqualsMode {
     bool enableAsymmetricMatchers;
     bool checkPrototypes;
     bool skipPrototypeIdentity;
-    bool (*deepEquals)(JSC::JSGlobalObject*, JSValue, JSValue, MarkedArgumentBuffer&, Vector<std::pair<JSValue, JSValue>, 16>&, ThrowScope&, bool);
-    bool (*nonIndexOwnPropertiesEqual)(JSC::JSGlobalObject*, MarkedArgumentBuffer&, Vector<std::pair<JSValue, JSValue>, 16>&, ThrowScope&, JSObject*, JSObject*);
+    bool (*deepEquals)(JSC::JSGlobalObject*, JSValue, JSValue, MarkedArgumentBuffer&, Bun::DeepEqualsStack&, ThrowScope&, bool);
+    bool (*nonIndexOwnPropertiesEqual)(JSC::JSGlobalObject*, MarkedArgumentBuffer&, Bun::DeepEqualsStack&, ThrowScope&, JSObject*, JSObject*);
 };
 
 template<bool isStrict, bool enableAsymmetricMatchers, bool checkPrototypes, bool skipPrototypeIdentity>
@@ -1406,10 +1406,16 @@ static constexpr DeepEqualsMode deepEqualsMode {
     checkPrototypes ? &nonIndexOwnPropertiesEqual<isStrict, enableAsymmetricMatchers, checkPrototypes, skipPrototypeIdentity> : nullptr,
 };
 
+static bool ownsEnumerableProperty(JSC::JSGlobalObject* globalObject, JSObject* object, PropertyName propertyName)
+{
+    PropertySlot slot(object, PropertySlot::InternalMethodType::GetOwnProperty);
+    return object->methodTable()->getOwnPropertySlot(object, globalObject, propertyName, slot) && !(slot.attributes() & PropertyAttribute::DontEnum);
+}
+
 // The per-type comparisons (Map, Set, Date, typed arrays, ...) are compiled once
 // and take the mode at runtime; only the dispatch and the plain-object tail in
 // `specialObjectsDequal` below stay specialised per mode.
-static std::optional<bool> specialObjectsDequalSlow(const DeepEqualsMode& mode, JSC::JSGlobalObject* globalObject, MarkedArgumentBuffer& gcBuffer, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>& stack, ThrowScope& scope, JSCell* _Nonnull c1, JSCell* _Nonnull c2)
+static std::optional<bool> specialObjectsDequalSlow(const DeepEqualsMode& mode, JSC::JSGlobalObject* globalObject, MarkedArgumentBuffer& gcBuffer, Bun::DeepEqualsStack& stack, ThrowScope& scope, JSCell* _Nonnull c1, JSCell* _Nonnull c2)
 {
     uint8_t c1Type = c1->type();
     uint8_t c2Type = c2->type();
@@ -1600,16 +1606,27 @@ static std::optional<bool> specialObjectsDequalSlow(const DeepEqualsMode& mode, 
                 return false;
             }
 
-            if (!mode.enableAsymmetricMatchers) {
-                // Node compares the non-enumerable `errors` of an AggregateError. Jest's toEqual does not.
+            bool errorsCompared = false;
+            if (mode.checkPrototypes || stack.nodeLegacy) {
+                // isEnumerableOrIdentical(val1, val2, 'errors'): https://github.com/nodejs/node/blob/v26.3.0/lib/internal/util/comparisons.js#L232-L236
                 const PropertyName errors(vm.propertyNames->errors);
-                auto leftErrors = left->get(globalObject, errors);
+                bool rightOwnsEnumerable = ownsEnumerableProperty(globalObject, right, errors);
                 RETURN_IF_EXCEPTION(scope, {});
-                auto rightErrors = right->get(globalObject, errors);
+                if (!rightOwnsEnumerable) {
+                    auto leftErrors = left->get(globalObject, errors);
+                    RETURN_IF_EXCEPTION(scope, {});
+                    auto rightErrors = right->get(globalObject, errors);
+                    RETURN_IF_EXCEPTION(scope, {});
+                    bool errorsEqual = mode.deepEquals(globalObject, leftErrors, rightErrors, gcBuffer, stack, scope, true);
+                    RETURN_IF_EXCEPTION(scope, {});
+                    if (!errorsEqual) {
+                        return false;
+                    }
+                    errorsCompared = true;
+                }
+                bool leftOwnsEnumerable = ownsEnumerableProperty(globalObject, left, errors);
                 RETURN_IF_EXCEPTION(scope, {});
-                bool errorsEqual = mode.deepEquals(globalObject, leftErrors, rightErrors, gcBuffer, stack, scope, true);
-                RETURN_IF_EXCEPTION(scope, {});
-                if (!errorsEqual) {
+                if (leftOwnsEnumerable != rightOwnsEnumerable) {
                     return false;
                 }
             }
@@ -1638,7 +1655,7 @@ static std::optional<bool> specialObjectsDequalSlow(const DeepEqualsMode& mode, 
             size_t i;
             for (i = 0; i < propertyArrayLength1; i++) {
                 Identifier i1 = a1[i];
-                if (i1 == vm.propertyNames->stack) continue;
+                if (i1 == vm.propertyNames->stack || (errorsCompared && i1 == vm.propertyNames->errors)) continue;
                 PropertyName propertyName1 = PropertyName(i1);
 
                 JSValue prop1 = left->get(globalObject, propertyName1);
@@ -1668,7 +1685,7 @@ static std::optional<bool> specialObjectsDequalSlow(const DeepEqualsMode& mode, 
             // for the remaining properties in the other object, make sure they are undefined
             for (; i < propertyArrayLength2; i++) {
                 Identifier i2 = a2[i];
-                if (i2 == vm.propertyNames->stack) continue;
+                if (i2 == vm.propertyNames->stack || (errorsCompared && i2 == vm.propertyNames->errors)) continue;
                 PropertyName propertyName2 = PropertyName(i2);
 
                 JSValue prop2 = right->getIfPropertyExists(globalObject, propertyName2);
@@ -2005,7 +2022,7 @@ static std::optional<bool> specialObjectsDequalSlow(const DeepEqualsMode& mode, 
 }
 
 template<bool isStrict, bool enableAsymmetricMatchers, bool checkPrototypes, bool skipPrototypeIdentity>
-std::optional<bool> specialObjectsDequal(JSC::JSGlobalObject* globalObject, MarkedArgumentBuffer& gcBuffer, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>& stack, ThrowScope& scope, JSCell* _Nonnull c1, JSCell* _Nonnull c2)
+std::optional<bool> specialObjectsDequal(JSC::JSGlobalObject* globalObject, MarkedArgumentBuffer& gcBuffer, Bun::DeepEqualsStack& stack, ThrowScope& scope, JSCell* _Nonnull c1, JSCell* _Nonnull c2)
 {
     VM& vm = globalObject->vm();
     uint8_t c1Type = c1->type();
@@ -2186,7 +2203,7 @@ std::optional<bool> specialObjectsDequal(JSC::JSGlobalObject* globalObject, Mark
 
 // The other combinations are instantiated by their uses in this file. This one is
 // only reached from `Bun.deepEquals(a, b, true, true)` in BunObject.cpp.
-template bool Bun__deepEquals<true, false, false, true>(JSC::JSGlobalObject*, JSValue, JSValue, MarkedArgumentBuffer&, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>&, ThrowScope&, bool);
+template bool Bun__deepEquals<true, false, false, true>(JSC::JSGlobalObject*, JSValue, JSValue, MarkedArgumentBuffer&, Bun::DeepEqualsStack&, ThrowScope&, bool);
 
 /**
  * @brief `Bun.deepMatch(a, b)`
@@ -2318,7 +2335,7 @@ bool Bun__deepMatch(
             // in such case, it expects exhaustive matching of any nested object properties, not just a subset,
             // and the user would need to opt-in to subset matching by using another nested objectContaining matcher
             if (enableAsymmetricMatchers && isMatchingObjectContaining) {
-                Vector<std::pair<JSValue, JSValue>, 16> stack;
+                Bun::DeepEqualsStack stack;
                 MarkedArgumentBuffer gcBuffer;
                 auto eql = Bun__deepEquals<false, true, false>(globalObject, prop, subsetProp, gcBuffer, stack, throwScope, true);
                 RETURN_IF_EXCEPTION(throwScope, false);
@@ -2354,7 +2371,7 @@ inline bool deepEqualsWrapperImpl(JSC::EncodedJSValue a, JSC::EncodedJSValue b, 
 {
     auto& vm = global->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16> stack;
+    Bun::DeepEqualsStack stack;
     MarkedArgumentBuffer args;
     bool result = Bun__deepEquals<isStrict, enableAsymmetricMatchers, checkPrototypes, skipPrototypeIdentity>(global, JSC::JSValue::decode(a), JSC::JSValue::decode(b), args, stack, scope, true);
     RELEASE_AND_RETURN(scope, result);
