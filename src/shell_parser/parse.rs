@@ -1862,7 +1862,9 @@ impl<'bump> Parser<'bump> {
                 | Token::DoubleBracketOpen
                 | Token::DoubleBracketClose
                 | Token::Delimit
-                | Token::Eof => unreachable!("the lexer puts no such token in the word of a ParamBegin"),
+                | Token::Eof => {
+                    unreachable!("the lexer puts no such token in the word of a ParamBegin")
+                }
             }
         }
 
@@ -1897,8 +1899,7 @@ impl<'bump> Parser<'bump> {
         IfClauseTok::from_text(self.text(range))
     }
 
-    // `parse_atom` runs `advance`, `is_at_end` and `r#match` for each word. Left to the inliner, they stay calls in
-    // the arms that it rates cold.
+    // `parse_atom` runs these three for each word: the inliner leaves calls to them in the arms it rates cold.
     #[inline(always)]
     fn advance(&mut self) -> Token {
         if !self.is_at_end() {
@@ -2395,8 +2396,7 @@ fn parse_tokens<'bump>(
     out_parser.insert(Parser::new(bump, lex_result)).parse()
 }
 
-/// Lexes and parses `src`. A pass that reads a `${NAME}` or a `${NAME<op>word}` can fail where a pass that reads
-/// every `${` as text does not. The script then runs from the text pass, unless it has a `:?` or a `?` form.
+/// Lexes and parses `src` again with every `${` as text when a form makes the first pass fail and none is a `?` form.
 fn lex_and_parse<'bump>(
     bump: &'bump Bump,
     src: &'bump [u8],
@@ -2428,8 +2428,7 @@ pub fn parse_script<'bump, E>(
 where
     E: From<LexerError> + From<ParseError> + From<crate::Error>,
 {
-    let (lex_result, script) =
-        lex_and_parse(bump, src, strings_to_escape, jsobjs_len, out_parser)?;
+    let (lex_result, script) = lex_and_parse(bump, src, strings_to_escape, jsobjs_len, out_parser)?;
     if !lex_result.errors.is_empty() {
         *out_lex_result = Some(lex_result);
         return Err(ParseError::Lex.into());
@@ -3699,10 +3698,8 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         true
     }
 
-    /// After a `$` outside single quotes: `$(...)`, `$NAME`, `$N`, a `${...}` form, or the `$` as text.
-    /// `true`: the `$` is text and a `{` follows it.
-    // `lex` runs this for each `$`. With the second caller (`lex_param_word`), the inliner leaves a call there.
-    #[inline(always)]
+    /// After a `$` outside single quotes. `true`: the `$` is text and a `{` follows it.
+    #[inline(always)] // `lex` runs this for each `$`, and `lex_param_word` is a second caller.
     fn eat_dollar(&mut self) -> Result<bool, LexerError> {
         let peeked = self.peek().unwrap_or(InputChar {
             char: 0,
@@ -3750,8 +3747,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         self.param_heads && self.chars.src_bytes_at_cursor().first() == Some(&b'{')
     }
 
-    /// At the `{` after a `$`: lexes `${NAME}`, `${0}`..`${9}` or `${NAME<op>word}`.
-    /// `false`: the source is none of these and nothing was read, so the `$` is text.
+    /// At the `{` after a `$`: lexes a form. `false`: the source is no form and nothing was read, so the `$` is text.
     #[cold]
     #[inline(never)]
     fn eat_braced_param(&mut self) -> Result<bool, LexerError> {
@@ -3805,10 +3801,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         Ok(true)
     }
 
-    /// Lexes the word of a `${NAME<op>word}` up to the `}` that ends the form. Operators are text in a word.
-    /// In a `quoted` form the word is in double quotes, and a `}` between an inner pair of `"` does not end it.
-    ///
-    /// An error from here is not shown: the callers of [`lex`] lex the script again with every `${` as text.
+    /// Lexes the word of a `${NAME<op>word}` up to the `}` that ends the form. `quoted`: the form is in double quotes.
     #[cold]
     fn lex_param_word(&mut self, quoted: bool) -> Result<(), LexerError> {
         let base_state = self.chars.state;
@@ -3847,6 +3840,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                         self.tokens.push(Token::ParamEnd);
                         return Ok(());
                     }
+                    // A `}` between a pair of `"` in a quoted form does not end the form.
                     b'"' if quoted => {
                         in_inner_quotes = !in_inner_quotes;
                         continue;
@@ -3933,8 +3927,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         Ok(())
     }
 
-    // `lex` runs this for each `$`. With the second caller (`lex_param_word`), the inliner leaves a call there.
-    #[inline(always)]
+    #[inline(always)] // `eat_dollar` has two callers: the inliner leaves a call to this in each.
     fn eat_var(&mut self) -> Result<TextRange, LexerError> {
         let start = self.j;
         let mut i: usize = 0;
@@ -4323,10 +4316,8 @@ impl<'a, const ENCODING: StringEncoding> ShellCharIter<'a, ENCODING> {
 
 // ───────────────────────────── var-name / eq helpers ─────────────────────────────
 
-/// Whether `src` ends in the head of a parameter expansion: `$NAME`, `${`, `${NAME`, `${NAME:` or `${NAME<op>`.
-/// Text added there would name the parameter, choose the operator or start the word.
-// The `$` tag runs this for each interpolated value: inlined into the builder, which is in another crate.
-#[inline]
+/// Whether text after `src` would name the parameter of a `$NAME` or a `${...}`, choose its operator or start its word.
+#[inline] // The `$` tag runs this for each interpolated value, from another crate.
 pub fn ends_in_param_head(src: &[u8]) -> bool {
     let Some(last) = src
         .iter()

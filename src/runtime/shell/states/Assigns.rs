@@ -143,8 +143,7 @@ impl Assigns {
         Yield::Next(this)
     }
 
-    /// A value did not expand. The assignments before it are made and the ones after it are not. The error goes to
-    /// the stderr of the parent: a statement, or the `Cmd` of these prefix assignments.
+    /// A value did not expand: its error goes to the stderr of the statement or the `Cmd` of these assignments.
     fn fail(interp: &Interpreter, this: NodeId, err: Option<ShellErr>) -> Yield {
         let parent = interp.as_assigns(this).base.parent;
         let stderr = match (&err, interp.node(parent).io()) {

@@ -277,16 +277,15 @@ impl Expansion {
         };
         // SAFETY: `shell_ptr` is a live env owned by the parent state
         // node and outlives this expansion.
-        let duped = match unsafe { &mut *shell_ptr }
-            .dupe_for_subshell(&io, ShellExecEnvKind::CmdSubst)
-        {
-            Ok(d) => d,
-            Err(e) => {
-                drop(io);
-                interp.throw(ShellErr::new_sys(&e));
-                return Yield::Failed(this);
-            }
-        };
+        let duped =
+            match unsafe { &mut *shell_ptr }.dupe_for_subshell(&io, ShellExecEnvKind::CmdSubst) {
+                Ok(d) => d,
+                Err(e) => {
+                    drop(io);
+                    interp.throw(ShellErr::new_sys(&e));
+                    return Yield::Failed(this);
+                }
+            };
         let script = Script::init(interp, duped, script_ast, this, io);
         interp.as_expansion_mut(this).child_script = Some(script);
         Script::start(interp, script)
@@ -614,8 +613,7 @@ impl Expansion {
             ast::Atom::Simple(_) => unreachable!("expand_simple_no_io leaves a Param"),
         };
         // An assignment value and a `[[ ]]` operand are one string.
-        let one_string =
-            me.assign_ctx || matches!(interp.node(me.base.parent), Node::CondExpr(_));
+        let one_string = me.assign_ctx || matches!(interp.node(me.base.parent), Node::CondExpr(_));
         match Self::open_word(interp, me, param, one_string) {
             Some(top) => Self::walk_words(
                 interp,
