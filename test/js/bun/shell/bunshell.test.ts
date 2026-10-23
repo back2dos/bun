@@ -1465,6 +1465,20 @@ booga"
         const run = (words: { raw: string }) => $`EMPTY=; ${BUN} -e ${printArgv} ${words}`.text();
         expect(await run(braced)).toBe(await run(bare));
       });
+
+      // sh gives one empty word. Bun's shell drops the word, for "$NAME" too. #44904 changes both.
+      raw('echo a "${SHELL_TEST_UNSET}" b')
+        .stdout("a  b\n")
+        .todo("needs #44904")
+        .runAsTest("unset in double quotes is one empty word");
+      raw('FOO=; echo a "${FOO}" b')
+        .stdout("a  b\n")
+        .todo("needs #44904")
+        .runAsTest("empty in double quotes is one empty word");
+      raw('echo a "${SHELL_TEST_UNSET:-}" b')
+        .stdout("a  b\n")
+        .todo("needs #44904")
+        .runAsTest("a form in double quotes that expands to nothing is one empty word");
     });
 
     describe("${NAME<op>word}", () => {
@@ -1474,6 +1488,17 @@ booga"
         const { stdout, stderr } = await $`${{ raw: setup }} ${BUN} -e ${printArgv} ${{ raw: src }}`;
         expect(stderr.toString()).toBe("");
         return JSON.parse(stdout.toString());
+      };
+      // The arguments that each of `words` gives, from one command. `E` is empty and HOME is /home/user.
+      const fieldsOf = async (words: string[], cwd = process.cwd()) => {
+        const { stdout, stderr } = await $`E=; ${BUN} -e ${printArgv} ${{ raw: words.join(" @@ ") }}`
+          .cwd(cwd)
+          .env({ ...bunEnv, HOME: "/home/user", USERPROFILE: "/home/user" })
+          .quiet();
+        expect(stderr.toString()).toBe("");
+        const fields: string[][] = [[]];
+        for (const arg of JSON.parse(stdout.toString())) arg === "@@" ? fields.push([]) : fields.at(-1)!.push(arg);
+        return fields;
       };
 
       // The result for a parameter that is not set, is empty, or is `v`. `!`: the command fails.
@@ -1571,11 +1596,48 @@ booga"
         );
       });
 
+      // What changes "$NAME" (#44904) must change each of these with it.
+      test('a form that expands to nothing in double quotes is what "$NAME" is', async () => {
+        const spellings = [
+          ...['"${U}"', '"${E}"', '"${9}"', '"${U:-}"', '"${U-}"', '"${E:-}"', '"${E-x}"', '"${9:-}"'],
+          ...['"${U:+x}"', '"${U+x}"', '"${E:+x}"', '"${E+}"', '"${E=x}"', '"${E?x}"'],
+          ...['"${U:-$U}"', '"${U:-${U}}"', '"${U:-$(true)}"', '"${U:-""}"', '${U:-"$U"}', '${U:-"$(true)"}'],
+          ...['"${SHELL_TEST_A:=}"', '"${SHELL_TEST_B=}"', '~"${U:-}"'],
+        ];
+        const echo = (word: string) => `echo a ${word} b`;
+        const bare = (word: string) => (word.startsWith("~") ? '~"$U"' : word.includes("E") ? '"$E"' : '"$U"');
+        const run = (script: string) => $`E=; ${{ raw: script }}`.text();
+        expect(await run(spellings.map(echo).join("\n"))).toBe(await run(spellings.map(bare).map(echo).join("\n")));
+        // A `""` in a word that is not in double quotes is one empty argument.
+        expect(await argvOf('a ${U:-""} ${U:-\'\'} "${U:-}""" b')).toEqual(["a", "", "", "", "b"]);
+      });
+
+      // Whitespace in the word ends no argument there.
+      raw(
+        [
+          '[[ ${U:-a b} == "a b" ]] && echo 1',
+          "[[ ${U:-a b} != ab ]] && echo 2",
+          '[[ ${U:-x $(echo a b)} == "x a b" ]] && echo 3',
+          "[[ -n ${U:- } ]] && echo 4",
+          "touch myfile; [[ -f ${U:-my file} ]] || echo 5",
+          '[[ ${S:=a  b} == "a  b" ]] && echo 6',
+        ].join("\n"),
+      )
+        .ensureTempDir()
+        .stdout("1\n2\n3\n4\n5\n6\n")
+        .runAsTest("a [[ ]] operand is one string");
+
       raw("echo hi > out_${SHELL_TEST_UNSET:-a}.txt; SET=b; echo hi > out_${SET:+c}.txt")
         .ensureTempDir()
         .fileEquals("out_a.txt", "hi\n")
         .fileEquals("out_c.txt", "hi\n")
         .runAsTest("in a redirect target");
+      raw("echo hi > ${U:-a b}")
+        .ensureTempDir()
+        .exitCode(1)
+        .stderr("bun: ambiguous redirect: at `echo`\n")
+        .doesNotExist("a")
+        .runAsTest("a redirect target of two words is ambiguous");
 
       test("a positional parameter", async () => {
         const { stdout } = await $`echo ${{ raw: "${0:+zero} ${0:-none} ${9:-none} ${9:+nine}." }}`;
@@ -1655,6 +1717,69 @@ booga"
         raw('HOME=/home/user USERPROFILE=/home/user && echo ${U:-~/a} a${U:-~} "${U:-~/a}" ${U:-a~}')
           .stdout("/home/user/a a/home/user ~/a a~\n")
           .runAsTest("a tilde starts the word");
+        // As in sh, the `~` is `$HOME` only when it is the whole word or a `/` follows it.
+        raw('S=1; echo ${U:-~abc} ${U:-~+} ${U:-~$S} ${U:-~$U} ${U:-~""} ${U:-~ b} ${U:=~abc} $U; echo ${V:=~} $V')
+          .env({ ...bunEnv, HOME: "/home/user", USERPROFILE: "/home/user" })
+          .stdout("~abc ~+ ~1 ~ ~ ~ b ~abc ~abc\n/home/user /home/user\n")
+          .runAsTest("a tilde before other text is text");
+
+        // A field ends where the word has whitespace. The `~` of the argument and a `""` go to their own field.
+        test("each field of an argument", async () => {
+          expect(
+            await fieldsOf([
+              "~/.cache${HOME:+ force}",
+              "~/x${U:- }",
+              "~/x${U:- ~/y}",
+              '~/a$(echo "b c")',
+              '${HOME:+name ""}',
+              '${U:-"" b}',
+              '${U:-a "" b}',
+              '${U:-"" ""}',
+            ]),
+          ).toEqual([
+            ["/home/user/.cache", "force"],
+            ["/home/user/x"],
+            ["/home/user/x", "~/y"],
+            ["/home/user/ab", "c"],
+            ["name", ""],
+            ["", "b"],
+            ["a", "", "b"],
+            ["", ""],
+          ]);
+        });
+
+        // The word expands in the same way with a `$(...)` in it.
+        test("a $(...) in the word changes no other part of it", async () => {
+          using dir = tempDir("shell-word-subst", { "a.txt": "", "src/x.ts": "" });
+          const pairs: [string, string, string[]][] = [
+            ["pre${U:- a $E}post", "pre${U:- a $(true)}post", ["pre", "a", "post"]],
+            ["a${U:-$E b}", "a${U:-$(true) b}", ["a", "b"]],
+            ["x${U:-$E a}", "x${U:-$E $(echo a)}", ["x", "a"]],
+            ["${U:-a $E}y", "${U:-$(echo a) $E}y", ["a", "y"]],
+            ["x=${U:-$E y}", "x=${U:-$(true) y}", ["x=", "y"]],
+            ["a${U:-${V:- b}}", "a${U:-${V:- b}$(true)}", ["a", "b"]],
+            ["${U:-${V:-b }}c", "${U:-$(true)${V:-b }}c", ["b", "c"]],
+            ["${U:-~/bin /opt/bin}", "${U:-~/bin $(echo /opt/bin)}", ["/home/user/bin", "/opt/bin"]],
+            ["${U:-~abc}", "${U:-~abc$(echo)}", ["~abc"]],
+            ["${U:-~}", "${U:-~}$(true)", ["/home/user"]],
+            ["${U:-src/*.ts}", "${U:-$(echo src)/*.ts}", ["src/x.ts"]],
+            ["${U:-a.*}", "${U:-$(echo a).*}", ["a.txt"]],
+            ["${U:-*.txt}$E", "${U:-*.txt$(true)}", ["a.txt"]],
+          ];
+          const expected = pairs.map(([, , fields]) => fields);
+          expect(
+            await fieldsOf(
+              pairs.map(([plain]) => plain),
+              String(dir),
+            ),
+          ).toEqual(expected);
+          expect(
+            await fieldsOf(
+              pairs.map(([, withSubst]) => withSubst),
+              String(dir),
+            ),
+          ).toEqual(expected);
+        });
 
         raw('echo ${U:-*.txt} "${U:-*.txt}" ${U:-a.*}')
           .ensureTempDir()
@@ -1679,7 +1804,16 @@ booga"
             "xb",
             "c",
           ]);
-          expect(await argvOf("{a,b}${U:-c } *${U:-d }")).not.toContain("");
+        });
+
+        // A `{a,b}` or a `*` expands only in the last field of an argument. sh expands it in each field.
+        test.failing("a brace group in a field that whitespace of a word ends", async () => {
+          expect(await argvOf("{a,b}${U:-c }")).toEqual(["ac", "bc"]);
+        });
+        test.failing("a glob in a field that whitespace of a word ends", async () => {
+          using dir = tempDir("shell-word-glob", { "a.txt": "" });
+          const { stdout } = await $`${BUN} -e ${printArgv} ${{ raw: "*.txt${U:- }" }}`.cwd(String(dir));
+          expect(JSON.parse(stdout.toString())).toEqual(["a.txt"]);
         });
 
         raw('S=é; echo ${S:-ü} ${U:-ü ö} "${U:-ü ö}" é${U:+ü}é')
@@ -1698,6 +1832,13 @@ booga"
           .stdout("sub\nsubst []\npipe\n[]\n")
           .runAsTest("not outside a subshell, a $(...) or a pipeline");
         raw('true ${A:=v}; echo "[$A]"').stdout("[v]\n").runAsTest("in the argument of a command that ignores it");
+        test("a quote or a * in the word is not syntax of the argument", async () => {
+          using dir = tempDir("shell-assign-word", { "a.txt": "" });
+          const { stdout } = await $`${BUN} -e ${printArgv} ${{ raw: "${A:=\"\"} ${B=''} ${C:=*.txt} x" }}`.cwd(
+            String(dir),
+          );
+          expect(JSON.parse(stdout.toString())).toEqual(["*.txt", "x"]);
+        });
         raw("echo ${9:=v}; echo after")
           .stdout("after\n")
           .stderr("bun: $9: cannot assign in this way\n")
@@ -1727,6 +1868,11 @@ booga"
           .stdout("after\n")
           .stderr("bun: U: one\nbun: U: two\n")
           .runAsTest("in the value of an assignment");
+        raw("VALUE=${U:?one}").exitCode(1).stderr("bun: U: one\n").runAsTest("an assignment alone has exit code 1");
+        raw("VALUE=${U:?two} echo cmd")
+          .exitCode(1)
+          .stderr("bun: U: two\n")
+          .runAsTest("an assignment before a command has exit code 1 and the command does not run");
         raw("VALUE=${U:?one}; VALUE=${U:?two} echo cmd; echo after")
           .quiet()
           .stdout("after\n")
@@ -1756,16 +1902,11 @@ booga"
           .runAsTest("set is the value");
       });
 
-      describe("an assignment before a command", () => {
-        test("is seen by a later assignment of that command", async () => {
-          const printB = "console.log(process.env.B)";
-          const later = { raw: "B=${A:-none}" };
-          expect(await $`A=x ${later} ${BUN} -e ${printB}`.text()).toBe("x\n");
-          expect(await $`A=x true; ${later} ${BUN} -e ${printB}`.text()).toBe("none\n");
-          const chain = { raw: 'A="${S:+dumb}" B=${A:-fallback}' };
-          expect(await $`S=1; ${chain} ${BUN} -e ${printB}`.text()).toBe("dumb\n");
-          expect(await $`${chain} ${BUN} -e ${printB}`.text()).toBe("fallback\n");
-        });
+      // sh reads the `A` of the same command. Bun's shell does not, for $A too.
+      test("an assignment before a command is not read by a later one, like $NAME", async () => {
+        const printB = "console.log(process.env.B)";
+        const run = (value: string) => $`A=x ${{ raw: "B=[" + value + "]" }} ${BUN} -e ${printB}`.text();
+        expect([await run("$A"), await run("${A}"), await run("${A:-none}")]).toEqual(["[]\n", "[]\n", "[none]\n"]);
       });
 
       test("reads an environment set with .env()", async () => {
@@ -1776,10 +1917,14 @@ booga"
         expect(exitCode).toBe(0);
       });
 
-      // A script with a form that does not end runs as it did before the forms were read.
+      // A script with a form that does not end runs with every `${` as text.
       raw("echo ${U:-a} $(echo ${U:-b) c}; echo next")
         .stdout("${U:-a} ${U:-b c}\nnext\n")
         .runAsTest("a form that does not end makes every form text");
+      // As text, a guard stops nothing. So a script that has one does not run.
+      raw('true "${U:?}" && echo RAN; echo ${V:-z')
+        .error("Unclosed parameter expansion")
+        .runAsTest("a form that does not end is an error in a script with a ? form");
       test("forms nest to the depth of $(...)", async () => {
         const repeat = (text: string, count: number) => Buffer.alloc(text.length * count, text).toString();
         const nested = (depth: number) => ({ raw: repeat("${A:-", depth) + "x" + repeat("}", depth) });

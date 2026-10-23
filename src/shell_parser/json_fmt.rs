@@ -300,10 +300,8 @@ fn write_param(w: &mut impl Write, p: &ParamExp<'_>) -> fmt::Result {
         }
         ParamTarget::Positional(n) => write!(w, "{{\"argv\":{}", n)?,
     }
-    write!(w, ",\"op\":\"{}\",\"quoted\":", p.op.as_str())?;
-    write_bool(w, p.quoted)?;
-    w.write_str(",\"word\":")?;
-    write_atom(w, &p.word)?;
+    write!(w, ",\"op\":\"{}\",\"word\":", p.op.as_str())?;
+    write_array(w, p.word, write_simple_atom)?;
     w.write_char('}')
 }
 

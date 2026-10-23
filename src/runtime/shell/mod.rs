@@ -162,6 +162,7 @@ pub(crate) mod ast {
     pub(crate) type Assign = p::Assign<'static>;
     pub(crate) type Atom = p::Atom<'static>;
     pub(crate) type SimpleAtom = p::SimpleAtom<'static>;
+    pub(crate) type CmdSubst = p::CmdSubst<'static>;
     pub(crate) type ParamExp = p::ParamExp<'static>;
     pub(crate) type ParamTarget = p::ParamTarget<'static>;
 }

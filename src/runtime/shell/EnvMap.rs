@@ -47,11 +47,6 @@ impl ArrayHashContext<EnvStr> for EnvMapContext {
 }
 
 impl EnvMap {
-    /// Whether two names are the same key of a map: on Windows the case of ASCII letters does not count.
-    pub(crate) fn is_same_name(a: &[u8], b: &[u8]) -> bool {
-        EnvMapContext.eql(&EnvStr::init_slice(a), &EnvStr::init_slice(b), 0)
-    }
-
     pub(crate) fn init() -> EnvMap {
         EnvMap {
             map: EnvMapInner::new(),

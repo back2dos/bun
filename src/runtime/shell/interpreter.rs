@@ -437,30 +437,14 @@ impl Interpreter {
         out_parser: &mut Option<bun_shell_parser::Parser<'a>>,
         out_lex_result: &mut Option<bun_shell_parser::LexResult<'a>>,
     ) -> crate::Result<bun_shell_parser::ast::Script<'a>> {
-        use crate::shell::shell_body::{ParseError, Parser};
-        let mut param_heads = true;
-        loop {
-            let lexed =
-                bun_shell_parser::lex(arena, src, jsstrings_to_escape, jsobjs_len, param_heads);
-            // See `bun_shell_parser::lex`. The second pass reads no `${...}` form, so it is the last one.
-            let retry_as_text = lexed.saw_param_head;
-            if retry_as_text && lexed.failed() {
-                param_heads = false;
-                continue;
-            }
-            let lex_result = lexed.result.map_err(crate::Error::from)?;
-            if !lex_result.errors.is_empty() {
-                *out_lex_result = Some(lex_result);
-                return Err(ParseError::Lex.into());
-            }
-            let parsed = out_parser.insert(Parser::new(arena, lex_result)).parse();
-            if parsed.is_err() && retry_as_text {
-                *out_parser = None;
-                param_heads = false;
-                continue;
-            }
-            return Ok(parsed?);
-        }
+        bun_shell_parser::parse_script(
+            arena,
+            src,
+            jsstrings_to_escape,
+            jsobjs_len,
+            out_parser,
+            out_lex_result,
+        )
     }
 
     /// Builds the root `ShellExecEnv` (export env from the event loop's

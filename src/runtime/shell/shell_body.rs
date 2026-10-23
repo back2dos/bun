@@ -32,9 +32,8 @@ pub(crate) use super::subproc; // declared once in `shell/mod.rs`
 // (still-draft) JSC bridge below. This file keeps the JSC-coupled half
 // (ShellErr, GlobalJS/Mini, shell_cmd_from_js, ShellSrcBuilder, TestingAPIs).
 pub(crate) use bun_shell_parser::parse::{
-    IfClauseTok, LEX_JS_OBJREF_PREFIX, LEX_JS_REF_TERMINATOR, LEX_JS_STRING_PREFIX, ParseError,
-    Parser, Token, ast, is_if_clause_keyword_bunstr, needs_escape_bunstr,
-    needs_escape_utf8_ascii_latin1,
+    IfClauseTok, LEX_JS_OBJREF_PREFIX, LEX_JS_REF_TERMINATOR, LEX_JS_STRING_PREFIX, Token, ast,
+    is_if_clause_keyword_bunstr, needs_escape_bunstr, needs_escape_utf8_ascii_latin1,
 };
 
 #[cfg(windows)]
@@ -130,7 +129,7 @@ pub(crate) mod test {
         CloseParen,
         Var(&'a [u8]),
         VarArgv(u8),
-        ParamBegin { op: ast::ParamOp, quoted: bool },
+        ParamBegin(ast::ParamOp),
         ParamSpace(&'a [u8]),
         ParamEnd,
         Text(&'a [u8]),
@@ -148,7 +147,7 @@ pub(crate) mod test {
             match the_token {
                 Token::Var(txt) => TestToken::Var(&buf[txt.start as usize..txt.end as usize]),
                 Token::VarArgv(int) => TestToken::VarArgv(int),
-                Token::ParamBegin { op, quoted } => TestToken::ParamBegin { op, quoted },
+                Token::ParamBegin(op) => TestToken::ParamBegin(op),
                 Token::ParamSpace(txt) => {
                     TestToken::ParamSpace(&buf[txt.start as usize..txt.end as usize])
                 }
@@ -225,12 +224,7 @@ pub(crate) mod test {
                     w.write_char('}')
                 }
                 T::VarArgv(n) => write!(w, "{{\"VarArgv\":{}}}", n),
-                T::ParamBegin { op, quoted } => write!(
-                    w,
-                    "{{\"ParamBegin\":{{\"op\":\"{}\",\"quoted\":{}}}}}",
-                    op.as_str(),
-                    quoted
-                ),
+                T::ParamBegin(op) => write!(w, "{{\"ParamBegin\":\"{}\"}}", op.as_str()),
                 T::ParamSpace(s) => {
                     w.write_str("{\"ParamSpace\":")?;
                     encode_json_string(w, s)?;
@@ -749,17 +743,13 @@ pub(crate) mod testing_apis {
         )?;
 
         let jsobjs_len: u32 = u32::try_from(marked_argument_buffer.size()).expect("int cast");
-        let mut lexed =
-            bun_shell_parser::lex(&arena, &script[..], &jsstrings[..], jsobjs_len, true);
-        if lexed.saw_param_head && lexed.failed() {
-            lexed = bun_shell_parser::lex(&arena, &script[..], &jsstrings[..], jsobjs_len, false);
-        }
-        let lex_result = match lexed.result {
-            Ok(lex_result) => lex_result,
-            Err(err) => {
-                return Err(global.throw_error(crate::Error::from(err), "failed to lex shell"));
-            }
-        };
+        let lex_result =
+            match bun_shell_parser::lex_script(&arena, &script[..], &jsstrings[..], jsobjs_len) {
+                Ok(lex_result) => lex_result,
+                Err(err) => {
+                    return Err(global.throw_error(crate::Error::from(err), "failed to lex shell"));
+                }
+            };
 
         if !lex_result.errors.is_empty() {
             let str = lex_result.combine_errors(&arena);

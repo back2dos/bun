@@ -174,24 +174,18 @@ impl Assigns {
         }
     }
 
-    /// IOWriter completion callback for the error written in `WaitingWriteErr`: on write failure finish with the
-    /// errno as the exit code, otherwise finish with exit code 1.
+    /// The error of `fail` is written, or the write failed: the exit code is 1 in both cases.
     pub(crate) fn on_io_writer_chunk(
         interp: &Interpreter,
         this: NodeId,
         _written: usize,
-        err: Option<bun_sys::SystemError>,
+        _err: Option<bun_sys::SystemError>,
     ) -> Yield {
         let me = interp.as_assigns_mut(this);
         debug_assert!(matches!(me.state, AssignsState::WaitingWriteErr));
         me.state = AssignsState::Done;
-        let exit_code: ExitCode = match err {
-            // Recover the positive errno (`to_shell_system_error` negated it).
-            Some(err) => err.errno.unsigned_abs() as ExitCode,
-            None => 1,
-        };
         let parent = me.base.parent;
-        interp.child_done(parent, this, exit_code)
+        interp.child_done(parent, this, 1)
     }
 
     pub(crate) fn deinit(_interp: &Interpreter, this: NodeId) {

@@ -729,11 +729,7 @@ pub mod ast {
     pub struct ParamExp<'arena> {
         pub target: ParamTarget<'arena>,
         pub op: ParamOp,
-        /// The `${` is inside double quotes.
-        pub quoted: bool,
-        /// The word holds a `$(...)`, directly or in a nested form, so it expands in a child `Expansion`.
-        pub word_has_cmd_subst: bool,
-        pub word: Atom<'arena>,
+        pub word: &'arena [SimpleAtom<'arena>],
     }
 
     #[derive(Clone)]
@@ -772,7 +768,7 @@ pub mod ast {
     pub struct CompoundAtom<'arena> {
         pub atoms: &'arena [SimpleAtom<'arena>],
         pub(crate) brace_expansion_hint: bool,
-        /// Also set when a `Param` word holds a `*` or a `ParamSpace`: `Expansion` ends such a word on the glob path.
+        /// Also set for a `*` in the word of a `Param`, which is a glob only when that word is the result.
         pub(crate) glob_hint: bool,
     }
 
@@ -1705,15 +1701,14 @@ impl<'bump> Parser<'bump> {
                             }
                         }
                     }
-                    Token::ParamBegin { .. } => {
-                        let param = self.parse_param()?;
-                        let ends_argument = param.word.has_glob_expansion();
-                        has_glob_syntax |= ends_argument;
+                    Token::ParamBegin(_) => {
+                        let (param, has_glob) = self.parse_param()?;
+                        has_glob_syntax |= has_glob;
                         atoms.push(ast::SimpleAtom::Param(param));
                         if self.delimits(self.peek()) {
                             let _ = self.r#match(TokenTag::Delimit);
                             // The hint is a field of a compound atom, so this lone `Param` is one.
-                            if ends_argument && atoms.len() == 1 {
+                            if has_glob && atoms.len() == 1 {
                                 return Ok(Some(ast::Atom::Compound(ast::CompoundAtom {
                                     atoms: atoms.into_bump_slice(),
                                     brace_expansion_hint: false,
@@ -1765,25 +1760,24 @@ impl<'bump> Parser<'bump> {
         })
     }
 
-    /// A `ParamBegin`, its parameter, the tokens of the word and the `ParamEnd`.
+    /// A `ParamBegin`, its parameter, the tokens of the word and the `ParamEnd`. Also: whether the word has a `*`.
     #[cold]
-    fn parse_param(&mut self) -> ParseResult<&'bump ast::ParamExp<'bump>> {
+    fn parse_param(&mut self) -> ParseResult<(&'bump ast::ParamExp<'bump>, bool)> {
         if !self.stack_check.is_safe_to_recurse() {
             self.add_error(format_args!("Nesting depth exceeded"))?;
             return Err(ParseError::NestingTooDeep.into());
         }
-        let Token::ParamBegin { op, quoted } = self.advance() else {
-            return self.unexpected_in_param();
+        let Token::ParamBegin(op) = self.advance() else {
+            unreachable!()
         };
         let target = match self.advance() {
             Token::Var(range) => ast::ParamTarget::Name(self.text(range)),
             Token::VarArgv(int) => ast::ParamTarget::Positional(int),
-            _ => return self.unexpected_in_param(),
+            _ => unreachable!("the lexer puts the parameter after a ParamBegin"),
         };
 
         let mut atoms = bun_alloc::ArenaVec::new_in(self.alloc);
-        let mut ends_argument = false;
-        let mut has_cmd_subst = false;
+        let mut has_glob = false;
         loop {
             let peeked = self.peek();
             match peeked {
@@ -1796,9 +1790,14 @@ impl<'bump> Parser<'bump> {
                 | Token::Text(range) => {
                     let _ = self.advance();
                     let txt = self.text(range);
+                    // As in sh, a `~` is `$HOME` only when it is the whole word or a `/` follows it.
+                    let is_tilde_prefix = atoms.is_empty()
+                        && peeked.tag() == TokenTag::Text
+                        && (txt.starts_with(b"~/")
+                            || (txt == b"~" && self.peek().tag() == TokenTag::ParamEnd));
                     if txt.is_empty() {
                         atoms.push(ast::SimpleAtom::QuotedEmpty);
-                    } else if atoms.is_empty() && peeked.tag() == TokenTag::Text && txt[0] == b'~' {
+                    } else if is_tilde_prefix {
                         atoms.push(ast::SimpleAtom::Tilde);
                         if txt.len() > 1 {
                             atoms.push(ast::SimpleAtom::Text(&txt[1..]));
@@ -1817,17 +1816,16 @@ impl<'bump> Parser<'bump> {
                 }
                 Token::ParamSpace(range) => {
                     let _ = self.advance();
-                    ends_argument = true;
                     atoms.push(ast::SimpleAtom::ParamSpace(self.text(range)));
                 }
                 Token::Asterisk => {
                     let _ = self.advance();
-                    ends_argument = true;
+                    has_glob = true;
                     atoms.push(ast::SimpleAtom::Asterisk);
                 }
                 Token::DoubleAsterisk => {
                     let _ = self.advance();
-                    ends_argument = true;
+                    has_glob = true;
                     atoms.push(ast::SimpleAtom::DoubleAsterisk);
                 }
                 Token::CmdSubstBegin => {
@@ -1840,35 +1838,40 @@ impl<'bump> Parser<'bump> {
                         script: script?,
                         quoted: is_quoted,
                     }));
-                    has_cmd_subst = true;
                 }
-                Token::ParamBegin { .. } => {
-                    let inner = self.parse_param()?;
-                    ends_argument |= inner.word.has_glob_expansion();
-                    has_cmd_subst |= inner.word_has_cmd_subst;
+                Token::ParamBegin(_) => {
+                    let (inner, inner_has_glob) = self.parse_param()?;
+                    has_glob |= inner_has_glob;
                     atoms.push(ast::SimpleAtom::Param(inner));
                 }
-                _ => return self.unexpected_in_param(),
+                Token::Pipe
+                | Token::DoublePipe
+                | Token::Ampersand
+                | Token::DoubleAmpersand
+                | Token::Redirect(_)
+                | Token::Semicolon
+                | Token::Newline
+                | Token::BraceBegin
+                | Token::Comma
+                | Token::BraceEnd
+                | Token::CmdSubstQuoted
+                | Token::CmdSubstEnd
+                | Token::OpenParen
+                | Token::CloseParen
+                | Token::JSObjRef(_)
+                | Token::DoubleBracketOpen
+                | Token::DoubleBracketClose
+                | Token::Delimit
+                | Token::Eof => unreachable!("the lexer puts no such token in the word of a ParamBegin"),
             }
         }
 
-        Ok(self.allocate(ast::ParamExp {
+        let param = self.allocate(ast::ParamExp {
             target,
             op,
-            quoted,
-            word_has_cmd_subst: has_cmd_subst,
-            word: ast::Atom::Compound(ast::CompoundAtom {
-                atoms: atoms.into_bump_slice(),
-                brace_expansion_hint: false,
-                glob_hint: ends_argument,
-            }),
-        }))
-    }
-
-    #[cold]
-    fn unexpected_in_param<T>(&mut self) -> ParseResult<T> {
-        self.add_error(format_args!("Unexpected token in a parameter expansion"))?;
-        Err(ParseError::Unexpected.into())
+            word: atoms.into_bump_slice(),
+        });
+        Ok((param, has_glob))
     }
 
     fn allocate<T>(&self, val: T) -> &'bump mut T {
@@ -2238,11 +2241,8 @@ pub enum Token {
 
     Var(TextRange),
     VarArgv(u8),
-    /// `${NAME<op>`: the next token is the parameter (`Var` or `VarArgv`), then the tokens of the word up to its `ParamEnd`.
-    ParamBegin {
-        op: ast::ParamOp,
-        quoted: bool,
-    },
+    /// `${NAME<op>`: the next token is the parameter (`Var` or `VarArgv`), then the word up to its `ParamEnd`.
+    ParamBegin(ast::ParamOp),
     /// A run of unquoted whitespace in the word of a `ParamBegin`.
     ParamSpace(TextRange),
     ParamEnd,
@@ -2306,7 +2306,7 @@ impl Token {
             Token::CloseParen => b"`)",
             Token::Var(r) => &strpool[r.start as usize..r.end as usize],
             Token::VarArgv(n) => VARARGV_STRINGS[n as usize],
-            Token::ParamBegin { .. } => b"`${`",
+            Token::ParamBegin(_) => b"`${`",
             Token::ParamSpace(r) => &strpool[r.start as usize..r.end as usize],
             Token::ParamEnd => b"`}`",
             Token::Text(r) => &strpool[r.start as usize..r.end as usize],
@@ -2323,10 +2323,7 @@ impl Token {
 
 // ───────────────────────────── Lexer ─────────────────────────────
 
-pub type LexerAscii<'bump> = Lexer<'bump, { StringEncoding::Ascii }>;
-pub type LexerUnicode<'bump> = Lexer<'bump, { StringEncoding::Wtf8 }>;
-
-const _: () = assert!(size_of::<LexerAscii<'static>>() == 200);
+const _: () = assert!(size_of::<Lexer<'static, { StringEncoding::Ascii }>>() == 200);
 
 #[derive(Clone, Copy)]
 pub struct LexResult<'bump> {
@@ -2350,51 +2347,105 @@ pub struct LexError {
 }
 
 /// One pass of the lexer over a script.
-pub struct Lexed<'bump> {
+struct LexPass<'bump> {
     /// `Err`: the lexer stopped before the end of the script.
-    pub result: Result<LexResult<'bump>, LexerError>,
-    /// The pass read a `${NAME}` or a `${NAME<op>word}`.
-    pub saw_param_head: bool,
+    result: Result<LexResult<'bump>, LexerError>,
+    saw_param_head: bool,
+    saw_param_guard: bool,
 }
 
-impl Lexed<'_> {
-    pub fn failed(&self) -> bool {
-        !matches!(&self.result, Ok(lexed) if lexed.errors.is_empty())
-    }
-}
-
-/// Lexes `src`. With `param_heads`, `${NAME}` and `${NAME<op>word}` are read.
-///
-/// When a pass with `param_heads` reads such a form and the script then fails to lex or to parse, lex the script
-/// again without `param_heads`. Every `${` is then text, so reading these forms makes no script fail.
-pub fn lex<'bump>(
+fn lex_pass<'bump>(
     bump: &'bump Bump,
     src: &'bump [u8],
     strings_to_escape: &'bump [BunString],
     jsobjs_len: u32,
     param_heads: bool,
-) -> Lexed<'bump> {
-    fn pass<'bump, const ENCODING: StringEncoding>(
+) -> LexPass<'bump> {
+    fn run<'bump, const ENCODING: StringEncoding>(
         bump: &'bump Bump,
         src: &'bump [u8],
         strings_to_escape: &'bump [BunString],
         jsobjs_len: u32,
         param_heads: bool,
-    ) -> Lexed<'bump> {
+    ) -> LexPass<'bump> {
         let mut lexer = Lexer::<ENCODING>::new(bump, src, strings_to_escape, jsobjs_len);
         lexer.param_heads = param_heads;
         let result = lexer.lex();
-        let saw_param_head = lexer.saw_param_head;
-        Lexed {
+        LexPass {
+            saw_param_head: lexer.saw_param_head,
+            saw_param_guard: lexer.saw_param_guard,
             result: result.map(|()| lexer.get_result()),
-            saw_param_head,
         }
     }
     if is_all_ascii(src) {
-        pass::<{ StringEncoding::Ascii }>(bump, src, strings_to_escape, jsobjs_len, param_heads)
+        run::<{ StringEncoding::Ascii }>(bump, src, strings_to_escape, jsobjs_len, param_heads)
     } else {
-        pass::<{ StringEncoding::Wtf8 }>(bump, src, strings_to_escape, jsobjs_len, param_heads)
+        run::<{ StringEncoding::Wtf8 }>(bump, src, strings_to_escape, jsobjs_len, param_heads)
     }
+}
+
+fn parse_tokens<'bump>(
+    bump: &'bump Bump,
+    lex_result: LexResult<'bump>,
+    out_parser: &mut Option<Parser<'bump>>,
+) -> crate::Result<ast::Script<'bump>> {
+    if !lex_result.errors.is_empty() {
+        return Err(crate::Error::Lex);
+    }
+    out_parser.insert(Parser::new(bump, lex_result)).parse()
+}
+
+/// Lexes and parses `src`. A pass that reads a `${NAME}` or a `${NAME<op>word}` can fail where a pass that reads
+/// every `${` as text does not. The script then runs from the text pass, unless it has a `:?` or a `?` form.
+fn lex_and_parse<'bump>(
+    bump: &'bump Bump,
+    src: &'bump [u8],
+    strings_to_escape: &'bump [BunString],
+    jsobjs_len: u32,
+    out_parser: &mut Option<Parser<'bump>>,
+) -> Result<(LexResult<'bump>, crate::Result<ast::Script<'bump>>), LexerError> {
+    let pass = lex_pass(bump, src, strings_to_escape, jsobjs_len, true);
+    let parsed = pass
+        .result
+        .map(|lex_result| (lex_result, parse_tokens(bump, lex_result, out_parser)));
+    if !pass.saw_param_head || pass.saw_param_guard || matches!(parsed, Ok((_, Ok(_)))) {
+        return parsed;
+    }
+    *out_parser = None;
+    let lex_result = lex_pass(bump, src, strings_to_escape, jsobjs_len, false).result?;
+    Ok((lex_result, parse_tokens(bump, lex_result, out_parser)))
+}
+
+/// Lexes and parses `src`. On `Err`, `out_lex_result` holds the errors of the lexer or `out_parser` those of the parser.
+pub fn parse_script<'bump, E>(
+    bump: &'bump Bump,
+    src: &'bump [u8],
+    strings_to_escape: &'bump [BunString],
+    jsobjs_len: u32,
+    out_parser: &mut Option<Parser<'bump>>,
+    out_lex_result: &mut Option<LexResult<'bump>>,
+) -> Result<ast::Script<'bump>, E>
+where
+    E: From<LexerError> + From<ParseError> + From<crate::Error>,
+{
+    let (lex_result, script) =
+        lex_and_parse(bump, src, strings_to_escape, jsobjs_len, out_parser)?;
+    if !lex_result.errors.is_empty() {
+        *out_lex_result = Some(lex_result);
+        return Err(ParseError::Lex.into());
+    }
+    Ok(script?)
+}
+
+/// The tokens that `parse_script` parses `src` from.
+pub fn lex_script<'bump>(
+    bump: &'bump Bump,
+    src: &'bump [u8],
+    strings_to_escape: &'bump [BunString],
+    jsobjs_len: u32,
+) -> Result<LexResult<'bump>, LexerError> {
+    let (lex_result, _) = lex_and_parse(bump, src, strings_to_escape, jsobjs_len, &mut None)?;
+    Ok(lex_result)
 }
 
 /// A special char used to denote the beginning of a special token
@@ -2455,7 +2506,7 @@ struct BacktrackSnapshot<'bump, const ENCODING: StringEncoding> {
     delimit_quote: bool,
 }
 
-pub struct Lexer<'bump, const ENCODING: StringEncoding> {
+pub(crate) struct Lexer<'bump, const ENCODING: StringEncoding> {
     pub(crate) chars: ShellCharIter<'bump, ENCODING>,
 
     /// Tell us the beginning of a "word", indexes into the string pool (`buf`)
@@ -2487,13 +2538,15 @@ pub struct Lexer<'bump, const ENCODING: StringEncoding> {
     pub(crate) jsobjs_len: u32,
 
     /// `${NAME}` and `${NAME<op>word}` are read. When off, a `${` is text.
-    pub(crate) param_heads: bool,
+    param_heads: bool,
     /// One of these forms was read.
-    pub(crate) saw_param_head: bool,
+    saw_param_head: bool,
+    /// A `${NAME:?word}` or a `${NAME?word}` was read.
+    saw_param_guard: bool,
 }
 
 impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
-    pub fn new(
+    fn new(
         bump: &'bump Bump,
         src: &'bump [u8],
         strings_to_escape: &'bump [BunString],
@@ -2514,10 +2567,11 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
             jsobjs_len,
             param_heads: true,
             saw_param_head: false,
+            saw_param_guard: false,
         }
     }
 
-    pub fn get_result(self) -> LexResult<'bump> {
+    fn get_result(self) -> LexResult<'bump> {
         LexResult {
             tokens: self.tokens.into_bump_slice(),
             strpool: self.strpool.into_bump_slice(),
@@ -2561,6 +2615,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
             jsobjs_len: self.jsobjs_len,
             param_heads: self.param_heads,
             saw_param_head: self.saw_param_head,
+            saw_param_guard: self.saw_param_guard,
         };
         sublexer.chars.state = CharState::Normal;
         sublexer
@@ -2582,6 +2637,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         self.j = sublexer.j;
         self.delimit_quote = sublexer.delimit_quote;
         self.saw_param_head = sublexer.saw_param_head;
+        self.saw_param_guard = sublexer.saw_param_guard;
     }
 
     fn make_snapshot(&self) -> BacktrackSnapshot<'bump, ENCODING> {
@@ -2609,7 +2665,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         Some(self.tokens[self.tokens.len() - 1].tag())
     }
 
-    pub fn lex(&mut self) -> Result<(), LexerError> {
+    fn lex(&mut self) -> Result<(), LexerError> {
         loop {
             // Fast path: bulk-consume runs of non-special bytes in Normal state.
             // The guard-arm chain below does not compile to a jump table in
@@ -2919,42 +2975,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                             if self.chars.state == CharState::Single {
                                 break 'escaped;
                             }
-
-                            let peeked = self.peek().unwrap_or(InputChar {
-                                char: 0,
-                                escaped: false,
-                            });
-                            if !peeked.escaped && peeked.char == u32::from(b'(') {
-                                self.break_word(AddDelimiter::No)?;
-                                self.eat_subshell(SubShellKind::Dollar)?;
-                                fell_through = true;
-                                break 'escaped;
-                            }
-
-                            // Handle variable
-                            self.break_word(AddDelimiter::No)?;
-                            let var_tok = self.eat_var()?;
-
-                            match var_tok.len() {
-                                0 => {
-                                    if !(self.at_braced_param() && self.eat_braced_param()?) {
-                                        self.append_char_to_str_pool(u32::from(b'$'))?;
-                                        self.break_word(AddDelimiter::No)?;
-                                    }
-                                }
-                                1 => 'blk: {
-                                    let c = self.strpool[var_tok.start as usize];
-                                    if c >= b'0' && c <= b'9' {
-                                        self.tokens.push(Token::VarArgv(c - b'0'));
-                                        break 'blk;
-                                    }
-                                    self.tokens.push(Token::Var(var_tok));
-                                }
-                                _ => {
-                                    self.tokens.push(Token::Var(var_tok));
-                                }
-                            }
-                            self.word_start = self.j;
+                            self.eat_dollar()?;
                             fell_through = true;
                         }
                         c if c == u32::from(b'(') => {
@@ -3678,6 +3699,51 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         true
     }
 
+    /// After a `$` outside single quotes: `$(...)`, `$NAME`, `$N`, a `${...}` form, or the `$` as text.
+    /// `true`: the `$` is text and a `{` follows it.
+    // `lex` runs this for each `$`. With the second caller (`lex_param_word`), the inliner leaves a call there.
+    #[inline(always)]
+    fn eat_dollar(&mut self) -> Result<bool, LexerError> {
+        let peeked = self.peek().unwrap_or(InputChar {
+            char: 0,
+            escaped: false,
+        });
+        if !peeked.escaped && peeked.char == u32::from(b'(') {
+            self.break_word(AddDelimiter::No)?;
+            self.eat_subshell(SubShellKind::Dollar)?;
+            return Ok(false);
+        }
+
+        // Handle variable
+        self.break_word(AddDelimiter::No)?;
+        let var_tok = self.eat_var()?;
+
+        let mut is_text_before_brace = false;
+        match var_tok.len() {
+            0 => {
+                let at_brace = self.at_braced_param();
+                if !(at_brace && self.eat_braced_param()?) {
+                    is_text_before_brace = at_brace;
+                    self.append_char_to_str_pool(u32::from(b'$'))?;
+                    self.break_word(AddDelimiter::No)?;
+                }
+            }
+            1 => 'blk: {
+                let c = self.strpool[var_tok.start as usize];
+                if c >= b'0' && c <= b'9' {
+                    self.tokens.push(Token::VarArgv(c - b'0'));
+                    break 'blk;
+                }
+                self.tokens.push(Token::Var(var_tok));
+            }
+            _ => {
+                self.tokens.push(Token::Var(var_tok));
+            }
+        }
+        self.word_start = self.j;
+        Ok(is_text_before_brace)
+    }
+
     /// After a `$` that no name follows: whether the source can start a `${...}` form.
     #[inline]
     fn at_braced_param(&self) -> bool {
@@ -3707,16 +3773,16 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         } else {
             return Ok(false);
         };
-        // Set before the depth error below, so that the script is lexed again with this form as text.
+        // Set before the depth error below: `parse_script` reads them when this pass fails.
         self.saw_param_head = true;
+        self.saw_param_guard |= op.is_some_and(|op| op.action == ast::ParamAction::Error);
         if op.is_some() && self.subshell_depth >= MAX_SUBSHELL_DEPTH {
             self.add_error(b"Subshell nesting depth exceeded");
             return Err(LexerError::SubshellDepthExceeded);
         }
 
-        let quoted = self.chars.state == CharState::Double;
         if let Some(op) = op {
-            self.tokens.push(Token::ParamBegin { op, quoted });
+            self.tokens.push(Token::ParamBegin(op));
         }
         if name[0].is_ascii_digit() {
             self.tokens.push(Token::VarArgv(name[0] - b'0'));
@@ -3733,7 +3799,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
         if op.is_some() {
             self.word_start = self.j;
             self.subshell_depth += 1;
-            self.lex_param_word(quoted)?;
+            self.lex_param_word(self.chars.state == CharState::Double)?;
             self.subshell_depth -= 1;
         }
         Ok(true)
@@ -3812,31 +3878,7 @@ impl<'bump, const ENCODING: StringEncoding> Lexer<'bump, ENCODING> {
                         }
                     }
                     b'$' if state != CharState::Single => {
-                        self.break_word(AddDelimiter::No)?;
-                        if self
-                            .peek()
-                            .is_some_and(|next| !next.escaped && next.char == u32::from(b'('))
-                        {
-                            self.eat_subshell(SubShellKind::Dollar)?;
-                            continue;
-                        }
-                        let var_tok = self.eat_var()?;
-                        match var_tok.len() {
-                            0 => {
-                                let at_brace = self.at_braced_param();
-                                if !(at_brace && self.eat_braced_param()?) {
-                                    text_braces += u32::from(at_brace && ends_form);
-                                    self.append_char_to_str_pool(u32::from(b'$'))?;
-                                    self.break_word(AddDelimiter::No)?;
-                                }
-                            }
-                            1 if self.strpool[var_tok.start as usize].is_ascii_digit() => {
-                                let digit = self.strpool[var_tok.start as usize];
-                                self.tokens.push(Token::VarArgv(digit - b'0'));
-                            }
-                            _ => self.tokens.push(Token::Var(var_tok)),
-                        }
-                        self.word_start = self.j;
+                        text_braces += u32::from(self.eat_dollar()? && ends_form);
                         continue;
                     }
                     b'`' if state != CharState::Single => {

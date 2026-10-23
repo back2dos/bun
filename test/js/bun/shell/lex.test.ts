@@ -825,8 +825,8 @@ describe("lex shell", () => {
   // here go to the lexer as a raw array.
   describe("${...}", () => {
     const tokens = (source: string) => JSON.parse(lex({ raw: [source] }));
-    const param = (op: string, target: string | number, word: object[], quoted = false) => [
-      { ParamBegin: { op, quoted } },
+    const param = (op: string, target: string | number, word: object[]) => [
+      { ParamBegin: op },
       typeof target === "number" ? { VarArgv: target } : { Var: target },
       ...word,
       { ParamEnd: {} },
@@ -880,7 +880,7 @@ describe("lex shell", () => {
 
     test.each(operators)("${NAME%sword}", op => {
       expect(tokens("${X" + op + "w}")).toEqual([...param(op, "X", [{ Text: "w" }]), { Eof: {} }]);
-      expect(tokens('"${X' + op + 'w}"')).toEqual([...param(op, "X", [{ DoubleQuotedText: "w" }], true), { Eof: {} }]);
+      expect(tokens('"${X' + op + 'w}"')).toEqual([...param(op, "X", [{ DoubleQuotedText: "w" }]), { Eof: {} }]);
       expect(tokens("${1" + op + "}")).toEqual([...param(op, 1, []), { Eof: {} }]);
     });
 
@@ -947,6 +947,16 @@ describe("lex shell", () => {
       expect(tokens(source)).toEqual([...param(":-", "X", word), { Eof: {} }]);
     });
 
+    // `$?` and the like are not read yet. What reads them must read them in a word too.
+    test.each(["$?", "$$", "$#", "$@", "$!", "$-", "$*", "$=", "$", "$NAME", "$1", "$9x", "${Y}", "${Y:-z}", "$(a)"])(
+      "the word: %s gives the tokens that it gives outside of a form",
+      dollar => {
+        const outside = tokens(dollar);
+        while ("Delimit" in outside.at(-1) || "Eof" in outside.at(-1)) outside.pop();
+        expect(tokens("${X:-" + dollar + "}")).toEqual([...param(":-", "X", outside), { Eof: {} }]);
+      },
+    );
+
     test.each([
       ["text and whitespace", '"${X:-a  b}"', [{ DoubleQuotedText: "a  b" }]],
       ["single quotes are text", '"${X:-\'a}"', [{ DoubleQuotedText: "'a" }]],
@@ -959,7 +969,7 @@ describe("lex shell", () => {
         [{ CmdSubstBegin: {} }, { CmdSubstQuoted: {} }, { Text: "echo" }, { Delimit: {} }, { CmdSubstEnd: {} }],
       ],
     ])("the word in double quotes: %s", (_name, source, word) => {
-      expect(tokens(source)).toEqual([...param(":-", "X", word, true), { Eof: {} }]);
+      expect(tokens(source)).toEqual([...param(":-", "X", word), { Eof: {} }]);
     });
 
     test.each([
@@ -1135,6 +1145,28 @@ describe("lex shell", () => {
         ],
       ],
       [
+        "a backtick in the word ends the backticks around the form",
+        "`echo ${X:-a`true`echo b}`",
+        [
+          { CmdSubstBegin: {} },
+          { Text: "echo" },
+          { Delimit: {} },
+          { Text: "$" },
+          { BraceBegin: {} },
+          { Text: "X:-a" },
+          { Delimit: {} },
+          { CmdSubstEnd: {} },
+          { CmdSubstBegin: {} },
+          { Text: "trueecho" },
+          { Delimit: {} },
+          { Text: "b" },
+          { BraceEnd: {} },
+          { Delimit: {} },
+          { CmdSubstEnd: {} },
+          { Eof: {} },
+        ],
+      ],
+      [
         "no closing brace for ${NAME} in $(...)",
         "$(echo ${X)",
         [
@@ -1156,6 +1188,26 @@ describe("lex shell", () => {
     test("a script with a form that does not end has the error it had as text", () => {
       expect(() => lex({ raw: ["${X:-$(echo}"] })).toThrow("Unclosed command substitution");
       expect(() => lex({ raw: ["${X:-a} |& b"] })).toThrow("Piping stdout and stderr (`|&`) is not supported yet.");
+    });
+
+    // As text, a `${NAME:?}` guard stops nothing. So a script with a guard is not lexed again.
+    test.each([
+      ["the guard before a form that does not end", 'true "${X:?}"; echo ${Y:-z'],
+      ["the guard after a form that does not end", "echo ${Y:-z; echo ${X?need X}"],
+      ["the guard that does not end", "echo ${X:?need X"],
+      ["the guard in the form that does not end", "echo ${Y:-${X?}"],
+      ["a backtick in a word in backticks", "${X:?}; `echo ${Y:-a`"],
+    ])("a form that does not end is an error in a script with a ? form: %s", (_name, source) => {
+      expect(() => lex({ raw: [source] })).toThrow("Unclosed parameter expansion");
+    });
+
+    test("the errors of a script with a ? form", () => {
+      expect(() => lex({ raw: ["${X:?}", ""] }, new Uint8Array(1))).not.toThrow();
+      expect(() => lex({ raw: ["${X:?} ${Y:-", "}"] }, new Uint8Array(1))).toThrow(
+        "JS object reference not allowed in a parameter expansion",
+      );
+      const repeat = (text: string, count: number) => Buffer.alloc(text.length * count, text).toString();
+      expect(() => lex({ raw: [repeat("${A?", 129) + repeat("}", 129)] })).toThrow("SubshellDepthExceeded");
     });
 
     test("forms nest to the depth of $(...), and deeper forms are text", () => {
