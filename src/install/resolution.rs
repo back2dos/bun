@@ -696,7 +696,7 @@ impl<'a, SemverInt: VersionInt> URLFormatter<'a, SemverInt> {
             // (and uses `BStr` internally); git/github URLs are ASCII in
             // practice so byte-exactness is preserved. A follow-up shard owns
             // `repository.rs` if that ever needs a byte-level path too.
-            Tag::Git => write!(writer, "{}", res.git().pinned(buf).fmt("git+", buf)),
+            Tag::Git => write!(writer, "{}", res.git().fmt("git+", buf)),
             Tag::Github => write!(writer, "{}", res.github().pinned(buf).fmt("github:", buf)),
             Tag::Workspace => {
                 writer.write_all(b"workspace:")?;
@@ -737,7 +737,7 @@ impl<'a, SemverInt: VersionInt> fmt::Display for URLFormatter<'a, SemverInt> {
             Tag::RemoteTarball => {
                 write!(writer, "{}", BStr::new(res.remote_tarball().slice(buf)))
             }
-            Tag::Git => res.git().pinned(buf).format_as("git+", buf, writer),
+            Tag::Git => res.git().format_as("git+", buf, writer),
             Tag::Github => res.github().pinned(buf).format_as("github:", buf, writer),
             Tag::Workspace => {
                 write!(

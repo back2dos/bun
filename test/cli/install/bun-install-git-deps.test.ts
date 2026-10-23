@@ -558,14 +558,16 @@ test.concurrent("requests a github: dependency as written when its committish ha
 // ref. bun.lock used to save the end of the name as the commit (`lib`, `deadbeef`), which no host can find. The label
 // of the package still ends so, and with it the name of its folder in the store of the isolated linker.
 test.concurrent.each([
-  ["my-lib", "lib", "hoisted", "install --frozen-lockfile"],
-  ["my-lib", "lib", "hoisted", "ci"],
-  ["my-lib", "lib", "hoisted", "pm fetch"],
-  ["my-lib", "lib", "isolated", "install --frozen-lockfile"],
-  ["my-lib-deadbeef", "deadbeef", "hoisted", "install --frozen-lockfile"],
+  ["my-lib", "pkg-a", "lib", "hoisted", "install --frozen-lockfile"],
+  ["my-lib", "pkg-a", "lib", "hoisted", "ci"],
+  ["my-lib", "pkg-a", "lib", "hoisted", "pm fetch"],
+  ["my-lib", "pkg-a", "lib", "isolated", "install --frozen-lockfile"],
+  ["my-lib-deadbeef", "pkg-a", "deadbeef", "hoisted", "install --frozen-lockfile"],
+  // the name of the repository in lower case, which ends like 7 digits of a commit
+  ["lib-0123456", "Lib-0123456", "0123456", "hoisted", "install --frozen-lockfile"],
 ] as const)(
-  "saves the ref of a github: tarball with the root %s (label #%s, %s), and `bun %s` downloads it again",
-  async (rootDir, tail, linker, command) => {
+  "saves the ref of a github: tarball with the root %s of the repository %s (label #%s, %s), and `bun %s` downloads it again",
+  async (rootDir, repo, tail, linker, command) => {
     using dir = tempDir("github-root-without-commit", {});
     const root = String(dir);
     const tarball = await tarballOf(rootDir, packageFiles(nameOf("a"), "pkg-a"));
@@ -575,20 +577,20 @@ test.concurrent.each([
       fetch(req) {
         const { pathname } = new URL(req.url);
         requests.push(pathname);
-        return pathname === "/repos/scope/pkg-a/tarball/v1"
+        return pathname === `/repos/scope/${repo}/tarball/v1`
           ? new Response(tarball)
           : new Response("not found", { status: 404 });
       },
     });
-    const project = writeProject(root, { [nameOf("a")]: "github:scope/pkg-a#v1" });
+    const project = writeProject(root, { [nameOf("a")]: `github:scope/${repo}#v1` });
     writeFileSync(join(project, "bunfig.toml"), `[install]\nlinker = "${linker}"\n`);
     const env = { GITHUB_API_URL: `http://localhost:${server.port}` };
-    const label = `github:scope/pkg-a#${tail}`;
+    const label = `github:scope/${repo}#${tail}`;
 
     const first = await runInstall(project, join(root, "cache"), env);
     expectInstalled(first.stdout, { [nameOf("a")]: label });
     expect(await lockedPackages(project)).toEqual({
-      [nameOf("a")]: [`${nameOf("a")}@github:scope/pkg-a#v1`, {}, rootDir, integrityOf(tarball)],
+      [nameOf("a")]: [`${nameOf("a")}@github:scope/${repo}#v1`, {}, rootDir, integrityOf(tarball)],
     });
 
     rmSync(join(project, "node_modules"), { recursive: true, force: true });
@@ -602,125 +604,13 @@ test.concurrent.each([
       store: linker === "isolated" ? readdirSync(join(project, "node_modules", ".bun")).sort() : [],
       exitCode: again.exitCode,
     }).toEqual({
-      requests: ["/repos/scope/pkg-a/tarball/v1", "/repos/scope/pkg-a/tarball/v1"],
+      requests: [`/repos/scope/${repo}/tarball/v1`, `/repos/scope/${repo}/tarball/v1`],
       installed: installs ? markers(["a"]) : { [nameOf("a")]: null },
-      store: linker === "isolated" ? [`@scope+pkg-a@github+scope+pkg-a+${tail}`, "node_modules"] : [],
+      store: linker === "isolated" ? [`@scope+pkg-a@github+scope+${repo}+${tail}`, "node_modules"] : [],
       exitCode: 0,
     });
   },
 );
-
-// Every ref of such a repository has the same root directory, so a download for another ref finds the package that the
-// lockfile has. `bun install` keeps what the lockfile pins. `bun update` takes the sha512 and the dependencies of the
-// download into that package, and it now takes the ref too. It used to keep the old ref beside the new sha512, and no
-// install with an empty cache could then get the package.
-test.concurrent.each(["bun.lock", "bun.lockb"] as const)(
-  "bun update locks a github: tarball without a commit in its root by the ref that it downloads (%s)",
-  async lockfile => {
-    using dir = tempDir("github-root-without-commit-update", {});
-    const root = String(dir);
-    const tarballs: Record<string, Uint8Array> = {
-      v1: await tarballOf("my-lib", packageFiles(nameOf("a"), "v1")),
-      v2: await tarballOf("my-lib", packageFiles(nameOf("a"), "v2")),
-    };
-    const requests: string[] = [];
-    await using server = Bun.serve({
-      port: 0,
-      fetch(req) {
-        const { pathname } = new URL(req.url);
-        requests.push(pathname);
-        const tarball = tarballs[pathname.replace("/repos/scope/pkg-a/tarball/", "")];
-        return tarball ? new Response(tarball) : new Response("not found", { status: 404 });
-      },
-    });
-    const env = { GITHUB_API_URL: `http://localhost:${server.port}` };
-    const project = writeProject(root, { [nameOf("a")]: "github:scope/pkg-a#v1" });
-    writeFileSync(join(project, "bunfig.toml"), `[install]\nsaveTextLockfile = ${lockfile === "bun.lock"}\n`);
-    const cache = join(root, "cache");
-    // The row of the package in bun.lock. bun.lockb has no text to read.
-    const locked = async () => (lockfile === "bun.lock" ? (await lockedPackages(project))[nameOf("a")] : []);
-    const row = (ref: string) =>
-      lockfile === "bun.lock"
-        ? [`${nameOf("a")}@github:scope/pkg-a#${ref}`, {}, "my-lib", integrityOf(tarballs[ref])]
-        : [];
-
-    const first = await runInstall(project, cache, env);
-    expect(diagnostics(first.stderr)).toEqual([]);
-    expect(await locked()).toEqual(row("v1"));
-
-    writeProject(root, { [nameOf("a")]: "github:scope/pkg-a#v2" });
-    const installed = await runInstall(project, cache, env);
-    expect(diagnostics(installed.stderr)).toEqual([]);
-    expect(await locked()).toEqual(row("v1"));
-
-    const updated = await runBun(project, cache, env, "update", nameOf("a"));
-    expect(diagnostics(updated.stderr)).toEqual([]);
-    expect(await locked()).toEqual(row("v2"));
-
-    rmSync(join(project, "node_modules"), { recursive: true, force: true });
-    requests.length = 0;
-    const again = await runInstall(project, join(root, "empty-cache"), env, "--frozen-lockfile");
-    expect(diagnostics(again.stderr)).toEqual([]);
-    expect({
-      requests,
-      installed: await installedVersionOf(project, nameOf("a")),
-      exitCode: again.exitCode,
-    }).toEqual({
-      requests: ["/repos/scope/pkg-a/tarball/v2"],
-      installed: "v2",
-      exitCode: 0,
-    });
-  },
-);
-
-// An earlier version saved the end of the root directory's name (`lib`) where the ref is. `bun update` downloads the
-// ref of package.json, and the package of the lockfile takes it.
-test.concurrent("bun update gives a github: package that bun.lock has as `#lib` its ref back", async () => {
-  using dir = tempDir("github-root-without-commit-heal", {});
-  const root = String(dir);
-  const tarball = await tarballOf("my-lib", packageFiles(nameOf("a"), "v1"));
-  const requests: string[] = [];
-  await using server = Bun.serve({
-    port: 0,
-    fetch(req) {
-      const { pathname } = new URL(req.url);
-      requests.push(pathname);
-      return pathname === "/repos/scope/pkg-a/tarball/v1"
-        ? new Response(tarball)
-        : new Response("not found", { status: 404 });
-    },
-  });
-  const env = { GITHUB_API_URL: `http://localhost:${server.port}` };
-  const project = writeProject(root, { [nameOf("a")]: "github:scope/pkg-a#v1" });
-  const saved = (ref: string) => [`${nameOf("a")}@github:scope/pkg-a#${ref}`, {}, "my-lib", integrityOf(tarball)];
-  writeFileSync(
-    join(project, "bun.lock"),
-    JSON.stringify({
-      lockfileVersion: 1,
-      configVersion: 1,
-      workspaces: { "": { name: "project", dependencies: { [nameOf("a")]: "github:scope/pkg-a#v1" } } },
-      packages: { [nameOf("a")]: saved("lib") },
-    }),
-  );
-
-  const updated = await runBun(project, join(root, "cache"), env, "update", nameOf("a"));
-  expect(diagnostics(updated.stderr)).toEqual([]);
-  expect(await lockedPackages(project)).toEqual({ [nameOf("a")]: saved("v1") });
-  expect(updated.exitCode).toBe(0);
-
-  rmSync(join(project, "node_modules"), { recursive: true, force: true });
-  const again = await runInstall(project, join(root, "empty-cache"), env, "--frozen-lockfile");
-  expect(diagnostics(again.stderr)).toEqual([]);
-  expect({
-    requests,
-    installed: await installedVersionOf(project, nameOf("a")),
-    exitCode: again.exitCode,
-  }).toEqual({
-    requests: ["/repos/scope/pkg-a/tarball/v1", "/repos/scope/pkg-a/tarball/v1"],
-    installed: "v1",
-    exitCode: 0,
-  });
-});
 
 // If a part of a GitHub dependency couldn't be found in the form that the URL parser returns, it was left empty. An
 // empty committish installed the default branch, and an empty owner requested `/repos//<repo>/`. Now such a dependency

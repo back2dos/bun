@@ -864,10 +864,17 @@ impl Stringifier {
                             } else {
                                 "github:"
                             };
+                            let committish = repo.committish.slice(buf);
+                            // Every reader cuts the key at its last `#`.
+                            let has_hash = strings::contains_char(committish, b'#');
                             // Bun before 1.4 reads version 1 and misreads other bytes (#24017).
-                            let keeps_label = lockfile_version == Version::V1
-                                && !is_tag_text(repo.committish.slice(buf));
-                            let key = if keeps_label { *repo } else { repo.pinned(buf) };
+                            let misread =
+                                lockfile_version == Version::V1 && !is_tag_text(committish);
+                            let key = if tag == ResolutionTag::Github && !has_hash && !misread {
+                                repo.pinned(buf)
+                            } else {
+                                *repo
+                            };
                             {
                                 use std::io::Write;
                                 let _ = write!(&mut temp_buf, "{}", key.fmt(prefix, buf));

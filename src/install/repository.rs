@@ -107,7 +107,7 @@ pub(crate) fn locked_scp_like(repo: &[u8]) -> Option<Vec<u8>> {
 pub(crate) const MAX_RESOLVED_TAG_LEN: usize = 256;
 
 /// `resolved` is the `.bun-tag` value persisted to the lockfile (a commit SHA for
-/// `git`, or `<owner>-<repo>-<sha>` for `github`). It is concatenated into a cache
+/// `git`, or the root folder of the tarball for `github`). It is concatenated into a cache
 /// directory name and passed to `git checkout`, so it must be a single safe path
 /// component: no separators, no NUL, and no leading `-` that git would parse as an
 /// option.
@@ -126,9 +126,9 @@ pub(crate) fn is_tag_text(text: &[u8]) -> bool {
         .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// True for the text of a commit: the 7 hex digits that GitHub's tarball root has, or all 40 or 64.
-pub(crate) fn is_commit(text: &[u8]) -> bool {
-    matches!(text.len(), 7 | 40 | 64) && text.iter().all(u8::is_ascii_hexdigit)
+/// True for all the digits of a commit: 40 hex digits, or 64 in a sha256 repository.
+fn is_full_commit(text: &[u8]) -> bool {
+    matches!(text.len(), 40 | 64) && text.iter().all(u8::is_ascii_hexdigit)
 }
 
 /// `resolved` from its last `-`: the end of the label, patch key and store name of a package.
@@ -257,15 +257,20 @@ impl RepositoryExt for Repository {
 
     fn resolved_commit<'a>(&'a self, buf: &'a [u8]) -> Option<&'a [u8]> {
         let resolved = self.resolved.slice(buf);
+        // Gitea names the root of a tarball after the repository.
+        if resolved.eq_ignore_ascii_case(self.repo.slice(buf)) {
+            return None;
+        }
         // A row from another lockfile has its committish as `resolved`, and that is a ref.
-        let tail = if resolved == self.committish.slice(buf) {
-            resolved
-        } else {
-            resolved_tail(resolved)
-        };
-        // Seven digits are a commit only at the end of a tarball root.
-        let is_short = tail.len() == 7;
-        (is_commit(tail) && (!is_short || tail.len() < resolved.len())).then_some(tail)
+        if resolved == self.committish.slice(buf) {
+            return is_full_commit(resolved).then_some(resolved);
+        }
+        // GitHub names the root `<owner>-<repo>-<7 hex>` after the repository's current names.
+        let tail = resolved_tail(resolved);
+        let is_short = tail.len() == 7
+            && tail.len() < resolved.len()
+            && tail.iter().all(u8::is_ascii_hexdigit);
+        (is_short || is_full_commit(tail)).then_some(tail)
     }
 
     fn pinned_ref<'a>(&'a self, buf: &'a [u8]) -> &'a [u8] {

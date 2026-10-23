@@ -207,15 +207,6 @@ impl PackageManager {
             if data.integrity.tag.is_supported() {
                 existing.meta.integrity = data.integrity;
             }
-            // A row with no commit names the ref that this sha512 comes from.
-            if existing.resolution.tag == ResolutionTag::Github {
-                let buf = self.lockfile.buffers.string_bytes.as_slice();
-                let fetched = package.resolution.github().committish;
-                let row = existing.resolution.github_mut();
-                if row.resolved_commit(buf).is_none() {
-                    row.committish = fetched;
-                }
-            }
             self.lockfile.packages.set(existing_id as usize, existing);
             package = existing;
         } else {

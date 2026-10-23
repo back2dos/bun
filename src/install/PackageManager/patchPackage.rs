@@ -47,9 +47,10 @@ fn print_resolution_label<'a>(
     label
 }
 
-/// True when `version` is the text that bun.lock has for a git or GitHub package.
+/// True when `version` is the text that bun.lock has for a GitHub package.
 fn is_lockfile_key_of(resolution: &Resolution, string_buf: &[u8], version: &[u8]) -> bool {
-    resolution.tag.is_git() && resolution.fmt_url(string_buf).to_string().as_bytes() == version
+    resolution.tag == ResolutionTag::Github
+        && resolution.fmt_url(string_buf).to_string().as_bytes() == version
 }
 
 /// Returns the `name@version` key that `patchedDependencies` uses for the package.
