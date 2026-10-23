@@ -15,8 +15,10 @@ use bun_collections::{ArrayHashMap, AutoBitSet, StringArrayHashMap};
 
 use crate::Graph::InputFileFlags;
 use crate::Index;
+use crate::bake_types;
 use crate::bundle_v2::BundleV2;
 use crate::bundle_v2::bv2_impl::{PatchImportRecordsCtx, ResolveImportRecordCtx};
+use crate::options_impl::TargetExt as _;
 use crate::parse_task;
 
 bun_core::declare_scope!(barrel, hidden);
@@ -29,6 +31,61 @@ pub enum RequestedExports {
 impl Default for RequestedExports {
     fn default() -> Self {
         RequestedExports::Partial(StringArrayHashMap::default())
+    }
+}
+
+/// Dev server: the barrels that have deferred a record, by graph and source path.
+///
+/// A build of the dev server parses only the new and the changed files, so
+/// `requested_exports` lacks what the modules of earlier builds read. For the life
+/// of the server, each graph's copy of a barrel is therefore in one of two states:
+/// - `Partial`: the copy that the dev server serves can have a deferred record.
+///   Every build that reaches the barrel parses it again (`must_reparse`), so each
+///   request is in `requested_exports` of that build, and
+///   `persist_requests_of_tracked_barrels` adds those requests to this set.
+/// - `All`, or no entry while the graph already has the file: every record of the
+///   served copy is live, and `apply_barrel_optimization` defers none of them
+///   again. Such a barrel is cached like any other module, so a build that skips
+///   it records no request for it.
+#[derive(Default)]
+pub struct TrackedBarrels {
+    by_graph: [StringArrayHashMap<RequestedExports>; 3],
+}
+
+impl TrackedBarrels {
+    #[inline]
+    fn get(&self, graph: bake_types::Graph, path: &[u8]) -> Option<&RequestedExports> {
+        let barrels = &self.by_graph[graph as usize];
+        // A lookup hashes the path: skip it for the projects that track no barrel.
+        if barrels.is_empty() {
+            return None;
+        }
+        barrels.get(path)
+    }
+
+    /// True if a build that reaches this file has to parse it again. An importer of
+    /// one graph can read the copy of another graph (a client component boundary),
+    /// so a copy with a deferred record in any graph counts.
+    pub fn must_reparse(&self, path: &[u8]) -> bool {
+        self.by_graph.iter().any(|barrels| {
+            !barrels.is_empty() && matches!(barrels.get(path), Some(RequestedExports::Partial(_)))
+        })
+    }
+
+    pub fn memory_cost(&self) -> usize {
+        let mut cost = 0;
+        for barrels in &self.by_graph {
+            cost += barrels.capacity()
+                * (size_of::<Box<[u8]>>() + size_of::<RequestedExports>() + size_of::<u32>());
+            for (path, requested) in barrels.iter() {
+                cost += path.len();
+                if let RequestedExports::Partial(names) = requested {
+                    cost += names.capacity() * (size_of::<Box<[u8]>>() + size_of::<u32>());
+                    cost += names.keys().iter().map(|name| name.len()).sum::<usize>();
+                }
+            }
+        }
+        cost
     }
 }
 
@@ -183,25 +240,33 @@ fn apply_barrel_optimization_impl(
         }
     }
 
-    // Dev server: also include exports persisted from previous builds. This
-    // handles the case where file A imports Alpha from the barrel (previous
-    // build) and file B adds Beta (current build). Without this, Alpha would
-    // be re-deferred because only B's requests are in requested_exports.
+    // Dev server: the modules of earlier builds that this build does not parse
+    // also read this barrel. See `TrackedBarrels`.
     // `DevServerHandle` is `Copy`; copied out so the `&self` borrow
     // doesn't conflict with later `&mut this.requested_exports`.
     let dev_handle = this.dev_server_handle().copied();
+    let graph = ast.target.bake_graph();
     if let Some(dev) = dev_handle {
-        // SAFETY: barrel_needed_exports is owned by DevServer; bundler runs on the bundle
-        // thread which holds the DevServer lock during this callback.
-        let needed = unsafe { &*dev.barrel_needed_exports() };
-        if let Some(persisted) = needed.get(result.source.path.text) {
-            for alias in persisted.keys() {
-                if let Some(resolution) =
-                    resolve_barrel_export(alias, &ast.named_exports, &ast.named_imports)
-                {
-                    needed_records.put(resolution.import_record_index, ())?;
+        // SAFETY: `tracked_barrels` is owned by DevServer. Only the bundle thread
+        // reads or writes it, and only during a bundle.
+        match unsafe { &*dev.tracked_barrels() }.get(graph, result.source.path.text) {
+            Some(RequestedExports::All) => return Ok(()),
+            Some(RequestedExports::Partial(persisted)) => {
+                for alias in persisted.keys() {
+                    if let Some(resolution) =
+                        resolve_barrel_export(alias, &ast.named_exports, &ast.named_imports)
+                    {
+                        needed_records.put(resolution.import_record_index, ())?;
+                    }
                 }
             }
+            // The dev server has this file and does not track it: every record of
+            // the served copy is live, and the builds that took that copy from the
+            // cache recorded no request for it.
+            None if dev.has_file(result.source.path.key_for_incremental_graph(), graph) => {
+                return Ok(());
+            }
+            None => {}
         }
     }
 
@@ -284,16 +349,82 @@ fn apply_barrel_optimization_impl(
 
         // Merge with existing entry (keep already-requested names) or create new
         let _ = RequestedExports::entry(&mut this.requested_exports, source_index);
+    }
 
-        // Register with DevServer so isFileCached returns null for this barrel,
-        // ensuring it gets re-parsed on every incremental build. This is needed
-        // because the set of needed exports can change when importing files change.
-        if let Some(dev) = dev_handle {
-            dev.register_barrel_with_deferrals(result.source.path.text)
-                .map_err(|_| AllocError)?;
+    if let Some(dev) = dev_handle {
+        // SAFETY: see the read of `tracked_barrels` above.
+        let barrels = &mut unsafe { &mut *dev.tracked_barrels() }.by_graph[graph as usize];
+        if has_deferrals {
+            barrels.get_or_put(result.source.path.text)?;
+        } else if let Some(requested) = barrels.get_mut(result.source.path.text) {
+            // Nothing is left to defer: the barrel can be cached.
+            *requested = RequestedExports::All;
         }
     }
 
+    Ok(())
+}
+
+/// Dev server, once per build when every file is parsed: add what the files of this
+/// build requested from each tracked barrel to `TrackedBarrels`, for the builds that
+/// do not parse those files.
+pub(crate) fn persist_requests_of_tracked_barrels(
+    this: &BundleV2,
+    dev: &crate::dispatch::DevServerHandle,
+) -> Result<(), AllocError> {
+    // SAFETY: `tracked_barrels` is owned by DevServer. Only the bundle thread
+    // reads or writes it, and only during a bundle.
+    let tracked = unsafe { &mut *dev.tracked_barrels() };
+    let parts = this.graph.ast.items_parts();
+    let targets = this.graph.ast.items_target();
+    let mut lookups: usize = 0;
+    let mut names_added: usize = 0;
+    for (graph, barrels) in tracked.by_graph.iter_mut().enumerate() {
+        if barrels.is_empty() {
+            continue;
+        }
+        // A file is in the path map of the target that imported it.
+        for (map_target, path_to_source_index) in this.graph.build_graphs.iter() {
+            if path_to_source_index.map.is_empty() {
+                continue;
+            }
+            for entry in barrels.iterator() {
+                let RequestedExports::Partial(kept) = entry.value_ptr else {
+                    continue;
+                };
+                lookups += 1;
+                let Some(source_index) = path_to_source_index.get(&**entry.key_ptr) else {
+                    continue;
+                };
+                match RequestedExports::lookup(&this.requested_exports, source_index) {
+                    Some(RequestedExports::All) => {
+                        // The barrel pass or the BFS made every record of that copy
+                        // live. A file that failed to parse has no target of its own.
+                        let copy_target = if parts[source_index as usize].len() != 0 {
+                            targets[source_index as usize]
+                        } else {
+                            map_target
+                        };
+                        if copy_target.bake_graph() as usize == graph {
+                            *entry.value_ptr = RequestedExports::All;
+                        }
+                    }
+                    Some(RequestedExports::Partial(requested)) => {
+                        for name in requested.keys() {
+                            names_added += !kept.get_or_put(name)?.found_existing as usize;
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    bun_core::scoped_log!(
+        barrel,
+        "persisted requests of tracked barrels: {} lookups, {} names added",
+        lookups,
+        names_added,
+    );
     Ok(())
 }
 
@@ -555,10 +686,6 @@ pub(crate) fn schedule_barrel_deferred_imports(
                 RequestedExports::Partial(p) => {
                     p.put(alias, ())?;
                 }
-            }
-            // Persist the export request on DevServer so it survives across builds.
-            if let Some(dev) = dev_handle {
-                persist_barrel_export(&dev, resolved_path_text, alias);
             }
         }
     }
@@ -993,12 +1120,4 @@ pub(crate) fn schedule_barrel_deferred_imports(
     }
 
     Ok(newly_scheduled)
-}
-
-/// Persist an export name for a barrel file on the DevServer. Called during
-/// seeding so that exports requested in previous builds are not lost when the
-/// barrel is re-parsed in an incremental build where the requesting file is
-/// not stale.
-fn persist_barrel_export(dev: &crate::dispatch::DevServerHandle, barrel_path: &[u8], alias: &[u8]) {
-    dev.register_barrel_export(barrel_path, alias)
 }

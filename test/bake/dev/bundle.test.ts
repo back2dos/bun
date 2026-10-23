@@ -1511,6 +1511,198 @@ devTest("barrel optimization: namespace re-export cycle through a star-exported 
     await c.expectMessage("result: object Y KEEP DEEP OTHER");
   },
 });
+
+// A build of the dev server parses only the new and the changed files. A barrel that
+// it parses again has to keep what the files of the earlier builds read from it.
+async function expectPage(dev: Dev, route: string, message: string) {
+  await using c = await dev.client(route);
+  await c.expectMessage(message);
+}
+
+const readsAOfEachBarrel = (label: string) => `
+  import { a as a1 } from 'by-export-star';
+  import { a as a2 } from 'by-namespace';
+  import { a as a3 } from 'by-import';
+  import { a as a4 } from 'by-require';
+  console.log('${label}: ' + [a1, a2, a3, a4].join(' '));
+`;
+devTest("barrel optimization: a later build keeps a request for every export", {
+  files: {
+    "first.html": emptyHtmlFile({ scripts: ["first.ts"] }),
+    "whole.html": emptyHtmlFile({ scripts: ["whole.ts"] }),
+    "last.html": emptyHtmlFile({ scripts: ["last.ts"] }),
+    "first.ts": readsAOfEachBarrel("first"),
+    "whole.ts": `
+      import { b as b1 } from './re-export';
+      import * as namespace from 'by-namespace';
+      const { b: b3 } = await import('by-import');
+      const b4 = require('by-require').b;
+      const read = (ns: any) => ns.b;
+      console.log('whole: ' + [b1, read(namespace), b3, b4].map(b => typeof b).join(' '));
+    `,
+    "re-export.ts": `export * from 'by-export-star';`,
+    "last.ts": readsAOfEachBarrel("last"),
+    ...abPackage("by-export-star", abBarrel),
+    ...abPackage("by-namespace", abBarrel),
+    ...abPackage("by-import", abBarrel),
+    ...abPackage("by-require", abBarrel),
+  },
+  async test(dev) {
+    // Each barrel defers b.js.
+    await expectPage(dev, "/first", "first: A A A A");
+    // Each barrel loads b.js.
+    await expectPage(dev, "/whole", "whole: function function function function");
+    // No file of this build reads b.
+    await expectPage(dev, "/last", "last: A A A A");
+    await expectPage(dev, "/whole", "whole: function function function function");
+  },
+});
+
+devTest("barrel optimization: a later build keeps a name requested through an outer barrel", {
+  files: {
+    "outer.html": emptyHtmlFile({ scripts: ["outer.ts"] }),
+    "inner.html": emptyHtmlFile({ scripts: ["inner.ts"] }),
+    // outer-lib is parsed, and defers its record of inner-lib, before fourth.ts asks it for b.
+    "outer.ts": `
+      import { own } from 'outer-lib';
+      import { b } from './second';
+      console.log('outer: ' + own + ' ' + typeof b);
+    `,
+    "second.ts": `export { b } from './third';`,
+    "third.ts": `export { b } from './fourth';`,
+    "fourth.ts": `export { b } from 'outer-lib';`,
+    "inner.ts": `
+      import { a } from 'inner-lib';
+      console.log('inner: ' + a);
+    `,
+    ...abPackage("outer-lib", `export { b } from 'inner-lib'; export { own } from './own.js';`),
+    "node_modules/outer-lib/own.js": `export const own = "OWN";`,
+    ...abPackage("inner-lib", abBarrel),
+  },
+  async test(dev) {
+    await expectPage(dev, "/outer", "outer: OWN function");
+    // This build parses inner-lib again, and not outer-lib.
+    await expectPage(dev, "/inner", "inner: A");
+    await expectPage(dev, "/outer", "outer: OWN function");
+  },
+});
+
+devTest("barrel optimization: a save of one importer keeps the requests of the other importers", {
+  files: {
+    "index.html": emptyHtmlFile({ scripts: ["index.ts"] }),
+    // lib is parsed, and defers b.js, before fourth.ts asks it for every export.
+    "index.ts": `
+      import { a } from 'lib';
+      import { b } from './second';
+      console.log('first: ' + a + ' ' + typeof b);
+    `,
+    "second.ts": `export { b } from './third';`,
+    "third.ts": `export { b } from './fourth';`,
+    "fourth.ts": `export * from 'lib';`,
+    ...abPackage("lib", abBarrel),
+  },
+  async test(dev) {
+    await using c = await dev.client("/");
+    await c.expectMessage("first: A function");
+    await c.expectReload(async () => {
+      await dev.patch("index.ts", { find: "first", replace: "second" });
+    });
+    await c.expectMessage("second: A function");
+  },
+});
+
+devTest("barrel optimization: a rebuild of a failing route keeps the requests made while the barrel was cached", {
+  files: {
+    "whole.html": emptyHtmlFile({ scripts: ["whole.ts"] }),
+    "named.html": emptyHtmlFile({ scripts: ["named.ts"] }),
+    "failing.html": emptyHtmlFile({ scripts: ["failing.ts"] }),
+    "whole.ts": `
+      import * as lib from 'lib';
+      const read = (ns: any) => ns.b;
+      console.log('whole: ' + typeof read(lib));
+    `,
+    "named.ts": `
+      import { b } from 'lib';
+      console.log('named: ' + typeof b);
+    `,
+    "failing.ts": `
+      import { a } from 'lib';
+      import { state } from './state';
+      console.log('failing: ' + a + ' ' + state);
+    `,
+    "state.ts": `export const state = "ok";`,
+    ...abPackage("lib", abBarrel),
+  },
+  async test(dev) {
+    // lib loads every record, so the later builds take it from the cache.
+    await expectPage(dev, "/whole", "whole: function");
+    await expectPage(dev, "/named", "named: function");
+    await expectPage(dev, "/failing", "failing: A ok");
+    await dev.write("state.ts", `import './missing';`, { errors: null });
+    // A request of a route with a build error builds every file of that route again: lib too.
+    {
+      await using c = await dev.client("/failing", {
+        errors: [`state.ts:1:8: error: Could not resolve: "./missing"`],
+      });
+    }
+    await expectPage(dev, "/named", "named: function");
+    await expectPage(dev, "/whole", "whole: function");
+  },
+});
+
+devTest("barrel optimization: a later build of server code keeps a request for every export", {
+  framework: minimalFramework,
+  files: {
+    "routes/first.ts": `
+      import { a } from 'lib';
+      export default function () {
+        return new Response('first: ' + a);
+      }
+    `,
+    "routes/whole.ts": `
+      import * as lib from 'lib';
+      const read = (ns: any) => ns.b;
+      export default function () {
+        return new Response('whole: ' + typeof read(lib));
+      }
+    `,
+    "routes/last.ts": `
+      import { a } from 'lib';
+      export default function () {
+        return new Response('last: ' + a);
+      }
+    `,
+    ...abPackage("lib", abBarrel),
+  },
+  async test(dev) {
+    await dev.fetch("/first").equals("first: A");
+    await dev.fetch("/whole").equals("whole: function");
+    await dev.fetch("/last").equals("last: A");
+    await dev.fetch("/whole").equals("whole: function");
+  },
+});
+
+devTest("barrel optimization: a barrel that is parsed again still defers what no file requested", {
+  files: {
+    "first.html": emptyHtmlFile({ scripts: ["first.ts"] }),
+    "second.html": emptyHtmlFile({ scripts: ["second.ts"] }),
+    "first.ts": `
+      import { a } from 'lib';
+      console.log('first: ' + a);
+    `,
+    "second.ts": `
+      import { b } from 'lib';
+      console.log('second: ' + typeof b);
+    `,
+    ...abPackage("lib", `${abBarrel} export { unused } from './unused.js';`),
+    "node_modules/lib/unused.js": `export const unused = <<<SYNTAX_ERROR>>>;`,
+  },
+  async test(dev) {
+    await expectPage(dev, "/first", "first: A");
+    await expectPage(dev, "/second", "second: function");
+    await expectPage(dev, "/first", "first: A");
+  },
+});
 // The dev server's runtime threw `$ERR_SSR_RESPONSE_EXPECTED(...)`, a name only src/js resolves: what the
 // user saw was "ReferenceError: $ERR_SSR_RESPONSE_EXPECTED is not defined".
 devTest("a render() that does not return a Response is reported as that", {

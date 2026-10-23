@@ -5943,6 +5943,8 @@ pub mod bv2_impl {
                     .cast::<DevServerInput>()
             };
 
+            barrel_imports::persist_requests_of_tracked_barrels(self, dev_server)?;
+
             /* arena: help_catch_memory_issues — no-op (mimalloc TLH check) */
 
             self.clone_ast().map_err(|_| AllocError)?;
