@@ -7,7 +7,7 @@ use crate::lockfile_real::package::{
 };
 use crate::lockfile_real::{self as lockfile, LoadResult, Lockfile};
 use crate::migration::{sbuf, string_hash};
-use crate::repository::{Repository, github_tarball_tag};
+use crate::repository::{Repository, github_tarball_tag, is_commit, is_safe_resolved_tag};
 use crate::resolution_real::{Resolution, TaggedValue as ResolutionValue};
 use crate::versioned_url::VersionedURL;
 use crate::{Error, Features, GetJsonResult};
@@ -210,6 +210,8 @@ impl<'a> Entry<'a> {
         self.commit = strings::split_once_char(url, b'#').map(|(_, commit)| commit);
         let url = Entry::url_without_hash(url);
         if let Some(github_path) = version.strip_prefix(b"github:") {
+            // Without a `#`, the shorthand names the default branch.
+            self.commit = Some(self.commit.unwrap_or_default());
             let path = Entry::url_without_hash(github_path);
             if let Some((_, repo)) = strings::split_once_char(path, b'/') {
                 self.git_repo_name = Some(Box::from(repo));
@@ -672,11 +674,13 @@ pub(crate) fn migrate_yarn_lockfile<'a>(
                     }
                 }
                 let is_github = !owner_str.is_empty() && !repo_str.is_empty();
-                let committish = if is_github {
-                    &commit[..7.min(commit.len())]
-                } else {
-                    commit
-                };
+                // Without a ref the entry pins nothing, and the install resolves the package.
+                if is_github && commit.is_empty() {
+                    break 'blk Resolution::default();
+                }
+                // yarn writes a commit. `bun install --yarn` writes the ref of a package with none.
+                let has_commit = is_github && is_commit(commit);
+                let committish = if has_commit { &commit[..7] } else { commit };
                 let package_name = entry.git_repo_name.as_deref().unwrap_or(repo_str);
                 let mut repository = Repository {
                     owner: sbuf!(this).append(owner_str)?,
@@ -687,7 +691,11 @@ pub(crate) fn migrate_yarn_lockfile<'a>(
                 };
                 // `resolved` names the cache folder, and is the commit that a git checkout uses.
                 let value = if is_github {
-                    if let Some(tag) = github_tarball_tag(owner_str, repo_str, commit) {
+                    if !has_commit {
+                        if is_safe_resolved_tag(commit) {
+                            repository.resolved = repository.committish;
+                        }
+                    } else if let Some(tag) = github_tarball_tag(owner_str, repo_str, commit) {
                         repository.resolved = sbuf!(this).append(&tag)?;
                     }
                     ResolutionValue::Github

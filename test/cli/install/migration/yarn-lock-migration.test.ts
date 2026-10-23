@@ -3785,3 +3785,69 @@ describe.concurrent("yarn.lock entries of packages that are not the registry's",
     },
   );
 });
+
+// `bun install --yarn` writes the text of a GitHub package that an install from yarn.lock downloads it by. A host behind
+// GITHUB_API_URL can name the root folder of a tarball after the repository (`my-lib`), and such a name ends in no
+// commit. The text then has the ref of package.json, where it used to have the end of the name (`#lib`). The
+// migration takes 7 digits of a commit from a GitHub entry, and it takes all of a ref.
+test.concurrent.each([
+  ["v1", "/v1"],
+  ["release-20240115", "/release-20240115"],
+  // eight hex digits are not the length of a commit
+  ["20240115", "/20240115"],
+  // no ref: the default branch
+  ["", "/"],
+])("bun install --yarn writes a github: package without a commit by its ref %p", async (ref, asked) => {
+  const spec = `github:testowner/my-lib${ref && "#"}${ref}`;
+  const tarball = await githubTarball("my-lib", {
+    "package.json": JSON.stringify({ name: "my-lib", version: "1.0.0" }),
+  });
+  const requests: string[] = [];
+  await using github = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const path = new URL(req.url).pathname.replace("/repos/testowner/my-lib/tarball", "");
+      requests.push(path);
+      return path === asked ? new Response(tarball) : new Response("not found", { status: 404 });
+    },
+  });
+  using dir = tempDir("yarn-github-root-without-commit", {
+    app: { "package.json": JSON.stringify({ name: "app", dependencies: { "my-lib": spec } }) },
+  });
+  const packageDir = join(String(dir), "app");
+  const install = async (cache: string, ...args: string[]) => {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "install", ...args],
+      cwd: packageDir,
+      env: { ...migrateEnv(dir), GITHUB_API_URL: github.url.origin, BUN_INSTALL_CACHE_DIR: join(String(dir), cache) },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stderr, exitCode] = await Promise.all([proc.stderr.text(), proc.exited]);
+    return { stderr, exitCode };
+  };
+
+  const exporting = await install("cache", "--yarn");
+  expect(exporting.stderr).not.toContain("error:");
+  const yarnLock = fs.readFileSync(join(packageDir, "yarn.lock"), "utf8");
+  expect(yarnLock.split("\n").filter(line => /^  (version|resolved) /.test(line))).toEqual([
+    `  version "${spec}"`,
+    `  resolved "${spec}"`,
+  ]);
+  expect(exporting.exitCode).toBe(0);
+
+  fs.rmSync(join(packageDir, "bun.lock"));
+  fs.rmSync(join(packageDir, "node_modules"), { recursive: true });
+  const migrating = await install("empty-cache");
+  expect(migrating.stderr).not.toContain("error:");
+  expect(migrating.stderr).toContain("migrated lockfile from yarn.lock");
+  expect({
+    requests,
+    installed: nodeModulesPackages(packageDir),
+    exitCode: migrating.exitCode,
+  }).toEqual({
+    requests: [asked, asked],
+    installed: "node_modules/my-lib/my-lib@1.0.0",
+    exitCode: 0,
+  });
+});

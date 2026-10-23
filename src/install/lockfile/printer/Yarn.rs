@@ -192,8 +192,15 @@ fn packages(lockfile: &Lockfile, writer: &mut impl bun_io::Write) -> Result<(), 
 
             writer.write_all(b"  version ")?;
 
+            let url_formatter = resolution.fmt_url(string_buf);
+
             // Version is always quoted
-            version_formatter.write_to(&mut quoted_buf)?;
+            if resolution.tag.is_git() {
+                // A reader of yarn.lock downloads the package by this text.
+                url_formatter.write_to(&mut quoted_buf)?;
+            } else {
+                version_formatter.write_to(&mut quoted_buf)?;
+            }
             writeln!(
                 writer,
                 "{}",
@@ -201,8 +208,6 @@ fn packages(lockfile: &Lockfile, writer: &mut impl bun_io::Write) -> Result<(), 
             )?;
 
             writer.write_all(b"  resolved ")?;
-
-            let url_formatter = resolution.fmt_url(string_buf);
 
             // Resolved URL is always quoted
             quoted_buf.clear();

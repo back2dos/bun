@@ -17,7 +17,7 @@ use crate::config_version::ConfigVersion;
 use crate::extract_tarball as ExtractTarball;
 use crate::integrity::Integrity;
 use crate::npm::Negatable;
-use crate::repository::RepositoryExt as _;
+use crate::repository::{RepositoryExt as _, is_tag_text};
 use crate::{
     DependencyID, Npm, Origin, PackageID, PackageManager, PackageNameHash, Repository, Resolution,
     TruncatedPackageNameHash,
@@ -864,9 +864,13 @@ impl Stringifier {
                             } else {
                                 "github:"
                             };
+                            // Bun before 1.4 reads version 1 and misreads other bytes (#24017).
+                            let keeps_label = lockfile_version == Version::V1
+                                && !is_tag_text(repo.committish.slice(buf));
+                            let key = if keeps_label { *repo } else { repo.pinned(buf) };
                             {
                                 use std::io::Write;
-                                let _ = write!(&mut temp_buf, "{}", repo.fmt(prefix, buf));
+                                let _ = write!(&mut temp_buf, "{}", key.fmt(prefix, buf));
                             }
                             write!(
                                 writer,
