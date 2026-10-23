@@ -482,7 +482,7 @@ impl Expansion {
     fn has_glob_syntax(me: &Expansion) -> bool {
         me.meta_offsets
             .iter()
-            .any(|&offset| me.current_out[offset as usize] == b'*')
+            .any(|&offset| me.current_out.get(offset as usize) == Some(&b'*'))
     }
 
     /// Kick off an off-thread

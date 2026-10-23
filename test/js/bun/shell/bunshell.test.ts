@@ -1807,6 +1807,14 @@ booga"
         });
 
         // A `{a,b}` or a `*` expands only in the last field of an argument. sh expands it in each field.
+        test("a brace group or a glob in a field that whitespace of a word ends is text", async () => {
+          expect(await argvOf("{a,b}${U:-c } *.none${U:-d } *.none${U:- e}")).toEqual([
+            "{a,b}c",
+            "*.noned",
+            "*.none",
+            "e",
+          ]);
+        });
         test.failing("a brace group in a field that whitespace of a word ends", async () => {
           expect(await argvOf("{a,b}${U:-c }")).toEqual(["ac", "bc"]);
         });
